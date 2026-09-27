@@ -1,3 +1,10 @@
+# Current status
+
+As of ruleset 2 / config schema 2, new integrations use source-local
+`zig-audit: acknowledge RULE` + non-empty `reason:` comments. The baseline-file
+journeys below are retained as historical design evidence and schema-1 migration
+context, not the current mitigation model.
+
 # User and agent journeys
 
 Status: exploratory lab notes, not a settled product contract.

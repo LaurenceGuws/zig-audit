@@ -30,9 +30,14 @@ pub fn build(b: *std.Build) void {
         .use_lld = !self_hosted,
     });
 
-    const check = b.step("check", "Compile zig-audit and its tests");
+    const check = b.step("check", "Compile, test, and audit zig-audit");
     check.dependOn(&executable.step);
     check.dependOn(&tests.step);
+
+    const audit = b.addRunArtifact(executable);
+    audit.addArg("check");
+    audit.setCwd(b.path("."));
+    check.dependOn(&audit.step);
 
     const test_step = b.step("test", "Run zig-audit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

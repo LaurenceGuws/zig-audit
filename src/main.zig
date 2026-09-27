@@ -46,12 +46,20 @@ const Kind = enum {
             .unreachable_site => "unreachable",
         };
     }
+
+    fn fromName(text: []const u8) ?Kind {
+        inline for (std.meta.tags(Kind)) |kind| {
+            if (std.mem.eql(u8, kind.name(), text)) return kind;
+        }
+        return null;
+    }
 };
 
 const Finding = struct {
     path: []const u8,
     kind: Kind,
     line: []const u8,
+    line_number: usize,
 };
 
 const Token = struct {
@@ -60,10 +68,35 @@ const Token = struct {
     start: usize,
 };
 
+const AcknowledgementProblem = enum {
+    none,
+    unknown_kind,
+    missing_reason,
+    empty_reason,
+};
+
+const Acknowledgement = struct {
+    marker_line: usize,
+    target_line: usize,
+    kind_text: []const u8,
+    kind: ?Kind,
+    reason: []const u8,
+    problem: AcknowledgementProblem,
+};
+
+const AcknowledgementResolution = enum {
+    acknowledged,
+    stale,
+    wrong_rule,
+    unknown_kind,
+    missing_reason,
+    empty_reason,
+};
+
 const Config = struct {
     schema: u32,
     source: Source,
-    baseline: []const u8,
+    baseline: ?[]const u8 = null,
     minimum_ruleset: u32 = 1,
     include: []const []const u8 = &.{},
     exclude: []const []const u8 = &.{},
@@ -73,33 +106,44 @@ const Config = struct {
     };
 };
 
-const version = "0.1.0";
-const stable_ruleset: u32 = 1;
-const config_schema: u32 = 1;
+const version = "0.2.0";
+const stable_ruleset: u32 = 2;
+const current_config_schema: u32 = 2;
+const legacy_config_schema: u32 = 1;
 const default_config_path = ".zig-audit.json";
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
-        if (failure != error.CensusChanged) emitFailure(init.io, failure);
+        if (failure != error.CensusChanged and failure != error.AuditFailed)
+            emitFailure(init.io, failure);
         std.process.exit(1);
     };
 }
 
+// zig-audit: acknowledge anyerror
+// reason: The top-level CLI boundary must format any command failure before process exit.
 fn emitFailure(io: std.Io, failure: anyerror) void {
     const message = switch (failure) {
-        error.ExpectedCommand => "expected command: check, accept, scan, or version",
+        error.ExpectedCommand => "expected command: check, scan, or version",
         error.ExpectedPath => "scan requires at least one Zig file or directory",
         error.InvalidArguments => "invalid command arguments",
         error.InvalidConfig => "project config is malformed or contains unsupported fields",
         error.UnsupportedConfigSchema => "project config schema is newer or unsupported",
         error.CheckerRulesetTooOld => "checker stable ruleset is older than the project minimum; upgrade zig-audit",
-        error.BaselineUnavailable => "reviewed baseline is unavailable",
+        error.BaselineUnavailable => "legacy reviewed baseline is unavailable",
+        error.LegacyBaselineRequired => "schema 1 requires a baseline path",
+        error.SourceAcknowledgementsRequired => "schema 2 uses source-local acknowledgements; accept is not available",
         error.SourceDiscoveryFailed => "configured source discovery failed",
+        error.AuditFailed => "source acknowledgement check failed",
         else => @errorName(failure),
     };
     var buffer: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    // zig-audit: acknowledge empty_catch
+    // reason: Fatal-path diagnostics are best-effort because the command failure already determines exit status.
     stderr.interface.print("zig-audit: {s}\n", .{message}) catch {};
+    // zig-audit: acknowledge empty_catch
+    // reason: Flushing fatal-path diagnostics cannot replace the command failure that is already being reported.
     stderr.interface.flush() catch {};
 }
 
@@ -114,7 +158,7 @@ fn run(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[1], "scan")) {
         if (args.len < 3) return error.ExpectedPath;
         const findings = try scanPaths(init, args[2..]);
-        return writeFindings(init.io, findings, false);
+        return writeFindings(init.io, findings);
     }
     if (std.mem.eql(u8, args[1], "check")) {
         if (args.len > 3) return error.InvalidArguments;
@@ -127,7 +171,7 @@ fn run(init: std.process.Init) !void {
 
     // Keep the original exploratory surface while the command shape is dogfooded.
     const findings = try scanPaths(init, args[1..]);
-    return writeFindings(init.io, findings, false);
+    return writeFindings(init.io, findings);
 }
 
 fn scanPaths(init: std.process.Init, paths: []const []const u8) ![]Finding {
@@ -139,11 +183,10 @@ fn scanPaths(init: std.process.Init, paths: []const []const u8) ![]Finding {
     return findings.toOwnedSlice(init.arena.allocator());
 }
 
-fn writeFindings(io: std.Io, findings: []const Finding, baseline_only: bool) !void {
+fn writeFindings(io: std.Io, findings: []const Finding) !void {
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
     for (findings) |finding| {
-        if (baseline_only and !baselineKind(finding.kind)) continue;
         try stdout.interface.print("{s}|{s}|{s}\n", .{
             finding.path,
             finding.kind.name(),
@@ -163,10 +206,17 @@ fn writeVersion(io: std.Io) !void {
     try stdout.interface.flush();
 }
 
-fn baselineKind(kind: Kind) bool {
+fn legacyBaselineKind(kind: Kind) bool {
     return switch (kind) {
         .any_error, .any_opaque, .any_type, .discard => true,
         else => false,
+    };
+}
+
+fn enforcedKind(kind: Kind) bool {
+    return switch (kind) {
+        .debug_assert, .saturating_add_mul => false,
+        else => true,
     };
 }
 
@@ -184,12 +234,20 @@ fn loadConfig(init: std.process.Init, path: []const u8) !Config {
         .{ .ignore_unknown_fields = false },
     ) catch return error.InvalidConfig;
     defer parsed.deinit();
-    if (parsed.value.schema != config_schema) return error.UnsupportedConfigSchema;
+    if (parsed.value.schema != legacy_config_schema and parsed.value.schema != current_config_schema)
+        return error.UnsupportedConfigSchema;
     if (parsed.value.minimum_ruleset > stable_ruleset) return error.CheckerRulesetTooOld;
+    if (parsed.value.schema == legacy_config_schema and parsed.value.baseline == null)
+        return error.LegacyBaselineRequired;
+    if (parsed.value.schema == current_config_schema and parsed.value.baseline != null)
+        return error.InvalidConfig;
     return .{
         .schema = parsed.value.schema,
         .source = parsed.value.source,
-        .baseline = try init.arena.allocator().dupe(u8, parsed.value.baseline),
+        .baseline = if (parsed.value.baseline) |value|
+            try init.arena.allocator().dupe(u8, value)
+        else
+            null,
         .minimum_ruleset = parsed.value.minimum_ruleset,
         .include = try dupeStrings(init.arena.allocator(), parsed.value.include),
         .exclude = try dupeStrings(init.arena.allocator(), parsed.value.exclude),
@@ -202,7 +260,7 @@ fn dupeStrings(allocator: Allocator, values: []const []const u8) ![]const []cons
     return copy;
 }
 
-fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
+fn projectPaths(init: std.process.Init, config: Config) ![]const []const u8 {
     return switch (config.source) {
         .git => blk: {
             const result = try std.process.run(init.gpa, init.io, .{
@@ -233,9 +291,13 @@ fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
                 if (path.len == 0 or !sourceSelected(config, path)) continue;
                 try paths.append(init.arena.allocator(), try init.arena.allocator().dupe(u8, path));
             }
-            break :blk try scanPaths(init, paths.items);
+            break :blk try paths.toOwnedSlice(init.arena.allocator());
         },
     };
+}
+
+fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
+    return scanPaths(init, try projectPaths(init, config));
 }
 
 fn sourceSelected(config: Config, path: []const u8) bool {
@@ -263,11 +325,11 @@ fn pathUnder(root: []const u8, path: []const u8) bool {
     return path.len > root.len and path[root.len] == '/';
 }
 
-fn stableCensus(init: std.process.Init, findings: []const Finding) ![]u8 {
+fn legacyCensus(init: std.process.Init, findings: []const Finding) ![]u8 {
     var output = try std.Io.Writer.Allocating.initCapacity(init.arena.allocator(), 4096);
     defer output.deinit();
     for (findings) |finding| {
-        if (!baselineKind(finding.kind)) continue;
+        if (!legacyBaselineKind(finding.kind)) continue;
         try output.writer.print("{s}|{s}|{s}\n", .{
             finding.path,
             finding.kind.name(),
@@ -299,11 +361,16 @@ fn normalizeCensus(allocator: Allocator, bytes: []const u8) ![]u8 {
 
 fn checkProject(init: std.process.Init, config_path: []const u8) !void {
     const config = try loadConfig(init, config_path);
+    if (config.schema == legacy_config_schema) return checkLegacyProject(init, config);
+    return checkAcknowledgedProject(init, config);
+}
+
+fn checkLegacyProject(init: std.process.Init, config: Config) !void {
     const findings = try projectFindings(init, config);
-    const actual = try stableCensus(init, findings);
+    const actual = try legacyCensus(init, findings);
     const expected = std.Io.Dir.cwd().readFileAlloc(
         init.io,
-        config.baseline,
+        config.baseline.?,
         init.arena.allocator(),
         .limited(16 * 1024 * 1024),
     ) catch return error.BaselineUnavailable;
@@ -316,9 +383,192 @@ fn checkProject(init: std.process.Init, config_path: []const u8) !void {
 
 fn acceptProject(init: std.process.Init, config_path: []const u8) !void {
     const config = try loadConfig(init, config_path);
+    if (config.schema != legacy_config_schema) return error.SourceAcknowledgementsRequired;
     const findings = try projectFindings(init, config);
-    const actual = try stableCensus(init, findings);
-    try writeAtomic(init.io, init.arena.allocator(), config.baseline, actual);
+    const actual = try legacyCensus(init, findings);
+    try writeAtomic(init.io, init.arena.allocator(), config.baseline.?, actual);
+}
+
+fn checkAcknowledgedProject(init: std.process.Init, config: Config) !void {
+    const paths = try projectPaths(init, config);
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
+    var failed = false;
+
+    for (paths) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            path,
+            init.arena.allocator(),
+            .limited(16 * 1024 * 1024),
+        );
+        const source = try init.arena.allocator().dupeSentinel(u8, bytes, 0);
+
+        var findings: std.ArrayList(Finding) = .empty;
+        try scanSource(init.arena.allocator(), path, source, &findings);
+
+        const acknowledgements = try parseAcknowledgements(init.arena.allocator(), source);
+        const matched = try init.arena.allocator().alloc(bool, findings.items.len);
+        @memset(matched, false);
+        const resolutions = try init.arena.allocator().alloc(AcknowledgementResolution, acknowledgements.len);
+        resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+
+        for (acknowledgements, resolutions) |ack, resolution| {
+            switch (resolution) {
+                .acknowledged => try stderr.interface.print(
+                    "ACK {s}:{d} {s}: {s}\n",
+                    .{ path, ack.target_line, ack.kind.?.name(), ack.reason },
+                ),
+                .unknown_kind => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} acknowledgement: unknown rule {s}\n",
+                        .{ path, ack.marker_line, ack.kind_text },
+                    );
+                },
+                .missing_reason => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} {s}: acknowledgement requires an adjacent // reason: line\n",
+                        .{ path, ack.marker_line, ack.kind_text },
+                    );
+                },
+                .empty_reason => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} {s}: acknowledgement reason is empty\n",
+                        .{ path, ack.marker_line, ack.kind_text },
+                    );
+                },
+                .wrong_rule => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} {s}: acknowledgement names the wrong rule for source line {d}\n",
+                        .{ path, ack.marker_line, ack.kind_text, ack.target_line },
+                    );
+                },
+                .stale => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} {s}: stale acknowledgement has no matching finding on source line {d}\n",
+                        .{ path, ack.marker_line, ack.kind_text, ack.target_line },
+                    );
+                },
+            }
+        }
+
+        for (findings.items, matched) |finding, acknowledged| {
+            if (!enforcedKind(finding.kind) or acknowledged) continue;
+            failed = true;
+            try stderr.interface.print(
+                "ERROR {s}:{d} {s}: acknowledgement required\n",
+                .{ path, finding.line_number, finding.kind.name() },
+            );
+        }
+    }
+
+    try stderr.interface.flush();
+    if (failed) return error.AuditFailed;
+}
+
+fn parseAcknowledgements(allocator: Allocator, source: []const u8) ![]Acknowledgement {
+    const marker_prefix = "// zig-audit: acknowledge ";
+    const reason_prefix = "// reason:";
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var line_iterator = std.mem.splitScalar(u8, source, '\n');
+    while (line_iterator.next()) |line| try lines.append(allocator, line);
+
+    var result: std.ArrayList(Acknowledgement) = .empty;
+    var index: usize = 0;
+    while (index < lines.items.len) {
+        const trimmed = std.mem.trim(u8, lines.items[index], " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, marker_prefix)) {
+            index += 1;
+            continue;
+        }
+
+        const group_start = result.items.len;
+        while (index < lines.items.len) {
+            const marker = std.mem.trim(u8, lines.items[index], " \t\r");
+            if (!std.mem.startsWith(u8, marker, marker_prefix)) break;
+
+            const kind_text = std.mem.trim(u8, marker[marker_prefix.len..], " \t\r");
+            var acknowledgement = Acknowledgement{
+                .marker_line = index + 1,
+                .target_line = 0,
+                .kind_text = kind_text,
+                .kind = Kind.fromName(kind_text),
+                .reason = "",
+                .problem = if (Kind.fromName(kind_text) == null) .unknown_kind else .none,
+            };
+
+            if (index + 1 >= lines.items.len) {
+                acknowledgement.problem = .missing_reason;
+                index += 1;
+            } else {
+                const reason_line = std.mem.trim(u8, lines.items[index + 1], " \t\r");
+                if (!std.mem.startsWith(u8, reason_line, reason_prefix)) {
+                    acknowledgement.problem = .missing_reason;
+                    index += 1;
+                } else {
+                    acknowledgement.reason = std.mem.trim(
+                        u8,
+                        reason_line[reason_prefix.len..],
+                        " \t\r",
+                    );
+                    if (acknowledgement.reason.len == 0) acknowledgement.problem = .empty_reason;
+                    index += 2;
+                }
+            }
+            try result.append(allocator, acknowledgement);
+        }
+
+        var target = index;
+        while (target < lines.items.len and
+            std.mem.trim(u8, lines.items[target], " \t\r").len == 0)
+        {
+            target += 1;
+        }
+        const target_line = target + 1;
+        for (result.items[group_start..]) |*acknowledgement| {
+            acknowledgement.target_line = target_line;
+        }
+        index = target;
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn resolveAcknowledgements(
+    findings: []const Finding,
+    acknowledgements: []const Acknowledgement,
+    matched: []bool,
+    resolutions: []AcknowledgementResolution,
+) void {
+    std.debug.assert(matched.len == findings.len);
+    std.debug.assert(resolutions.len == acknowledgements.len);
+
+    for (acknowledgements, resolutions) |ack, *resolution| {
+        resolution.* = switch (ack.problem) {
+            .unknown_kind => .unknown_kind,
+            .missing_reason => .missing_reason,
+            .empty_reason => .empty_reason,
+            .none => blk: {
+                var other_unmatched = false;
+                for (findings, matched, 0..) |finding, acknowledged, index| {
+                    if (!enforcedKind(finding.kind) or finding.line_number != ack.target_line or acknowledged)
+                        continue;
+                    if (finding.kind == ack.kind.?) {
+                        matched[index] = true;
+                        break :blk .acknowledged;
+                    }
+                    other_unmatched = true;
+                }
+                break :blk if (other_unmatched) .wrong_rule else .stale;
+            },
+        };
+    }
 }
 
 fn writeCensusDiff(io: std.Io, expected: []const u8, actual: []const u8) !void {
@@ -377,10 +627,15 @@ fn writeAtomic(io: std.Io, allocator: Allocator, path: []const u8, bytes: []cons
 
     const temporary = try std.fmt.allocPrint(allocator, ".{s}.zig-audit.tmp", .{leaf});
     defer allocator.free(temporary);
-    parent.deleteFile(io, temporary) catch {};
+    parent.deleteFile(io, temporary) catch |failure| switch (failure) {
+        error.FileNotFound => {},
+        else => return failure,
+    };
     var file = try parent.createFile(io, temporary, .{ .truncate = true, .exclusive = true });
     var open = true;
     defer if (open) file.close(io);
+    // zig-audit: acknowledge empty_catch
+    // reason: Rollback cleanup is best-effort and must not replace the primary publication failure.
     errdefer parent.deleteFile(io, temporary) catch {};
 
     try file.writeStreamingAll(io, bytes);
@@ -501,7 +756,11 @@ fn scanSource(
             .keyword_allowzero => try add(allocator, path, source, token.start, .allow_zero, findings),
             .keyword_anytype => try add(allocator, path, source, token.start, .any_type, findings),
             .keyword_opaque => try add(allocator, path, source, token.start, .opaque_type, findings),
-            .keyword_unreachable => try add(allocator, path, source, token.start, .unreachable_site, findings),
+            .keyword_unreachable => {
+                const previous = if (index == 0) null else tokens.items[index - 1].tag;
+                if (previous != .keyword_catch and previous != .keyword_orelse)
+                    try add(allocator, path, source, token.start, .unreachable_site, findings);
+            },
             .keyword_orelse => {
                 if (index + 1 < tokens.items.len and tokens.items[index + 1].tag == .keyword_unreachable) {
                     try add(allocator, path, source, token.start, .orelse_unreachable, findings);
@@ -597,6 +856,7 @@ fn add(
         .path = path,
         .kind = kind,
         .line = line,
+        .line_number = 1 + std.mem.count(u8, source[0..offset], "\n"),
     });
 }
 
@@ -715,13 +975,13 @@ test "baseline normalization ignores ordering but preserves duplicates" {
 }
 
 test "stable census vocabulary stays narrower than exploratory scan" {
-    try std.testing.expect(baselineKind(.any_type));
-    try std.testing.expect(baselineKind(.any_error));
-    try std.testing.expect(baselineKind(.any_opaque));
-    try std.testing.expect(baselineKind(.discard));
-    try std.testing.expect(!baselineKind(.empty_catch));
-    try std.testing.expect(!baselineKind(.opaque_type));
-    try std.testing.expect(!baselineKind(.ptr_from_int));
+    try std.testing.expect(legacyBaselineKind(.any_type));
+    try std.testing.expect(legacyBaselineKind(.any_error));
+    try std.testing.expect(legacyBaselineKind(.any_opaque));
+    try std.testing.expect(legacyBaselineKind(.discard));
+    try std.testing.expect(!legacyBaselineKind(.empty_catch));
+    try std.testing.expect(!legacyBaselineKind(.opaque_type));
+    try std.testing.expect(!legacyBaselineKind(.ptr_from_int));
 }
 
 test "source scope uses exact roots and directory prefixes" {
@@ -742,4 +1002,203 @@ test "source scope uses exact roots and directory prefixes" {
 
 test "minimum ruleset rejects a stale checker contract" {
     try std.testing.expect(stable_ruleset >= 1);
+}
+
+test "source acknowledgements bind exact rules to the next source line" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\// reason: the result is intentionally ignored.
+        \\// zig-audit: acknowledge ptr_cast
+        \\// reason: the ABI requires this pointer representation.
+        \\_ = @ptrCast(p);
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    const matched = try std.testing.allocator.alloc(bool, findings.items.len);
+    defer std.testing.allocator.free(matched);
+    @memset(matched, false);
+    const resolutions = try std.testing.allocator.alloc(AcknowledgementResolution, acknowledgements.len);
+    defer std.testing.allocator.free(resolutions);
+
+    resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+    try std.testing.expectEqual(@as(usize, 2), acknowledgements.len);
+    try std.testing.expectEqual(AcknowledgementResolution.acknowledged, resolutions[0]);
+    try std.testing.expectEqual(AcknowledgementResolution.acknowledged, resolutions[1]);
+    for (findings.items, matched) |finding, acknowledged| {
+        if (enforcedKind(finding.kind)) try std.testing.expect(acknowledged);
+    }
+}
+
+test "acknowledgement can cross whitespace but not unrelated source" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\// reason: removal return value is irrelevant.
+        \\
+        \\_ = list.swapRemove(0);
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    try std.testing.expectEqual(@as(usize, 1), acknowledgements.len);
+    try std.testing.expectEqual(@as(usize, 4), acknowledgements[0].target_line);
+}
+
+test "wrong rule acknowledgement fails locally" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge anytype
+        \\// reason: deliberately wrong for the regression.
+        \\_ = value;
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    const matched = try std.testing.allocator.alloc(bool, findings.items.len);
+    defer std.testing.allocator.free(matched);
+    @memset(matched, false);
+    const resolutions = try std.testing.allocator.alloc(AcknowledgementResolution, acknowledgements.len);
+    defer std.testing.allocator.free(resolutions);
+
+    resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+    try std.testing.expectEqual(AcknowledgementResolution.wrong_rule, resolutions[0]);
+}
+
+test "stale acknowledgement fails instead of drifting forward" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\// reason: this marker has no sensitive source below it.
+        \\const value: u8 = 1;
+        \\_ = value;
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    const matched = try std.testing.allocator.alloc(bool, findings.items.len);
+    defer std.testing.allocator.free(matched);
+    @memset(matched, false);
+    const resolutions = try std.testing.allocator.alloc(AcknowledgementResolution, acknowledgements.len);
+    defer std.testing.allocator.free(resolutions);
+
+    resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+    try std.testing.expectEqual(AcknowledgementResolution.stale, resolutions[0]);
+}
+
+test "acknowledgement requires a reason line" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\_ = value;
+        \\
+    ;
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    try std.testing.expectEqual(@as(usize, 1), acknowledgements.len);
+    try std.testing.expectEqual(AcknowledgementProblem.missing_reason, acknowledgements[0].problem);
+}
+
+test "acknowledgement rejects an empty reason" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\// reason:
+        \\_ = value;
+        \\
+    ;
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    try std.testing.expectEqual(AcknowledgementProblem.empty_reason, acknowledgements[0].problem);
+}
+
+test "one acknowledgement consumes only one duplicate finding" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge discard
+        \\// reason: only one discard is intentionally acknowledged.
+        \\_ = first; _ = second;
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    const matched = try std.testing.allocator.alloc(bool, findings.items.len);
+    defer std.testing.allocator.free(matched);
+    @memset(matched, false);
+    const resolutions = try std.testing.allocator.alloc(AcknowledgementResolution, acknowledgements.len);
+    defer std.testing.allocator.free(resolutions);
+
+    resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+    var matched_discards: usize = 0;
+    var total_discards: usize = 0;
+    for (findings.items, matched) |finding, acknowledged| {
+        if (finding.kind != .discard) continue;
+        total_discards += 1;
+        if (acknowledged) matched_discards += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), total_discards);
+    try std.testing.expectEqual(@as(usize, 1), matched_discards);
+}
+
+test "specific unreachable forms do not double report generic unreachable" {
+    const source: [:0]const u8 =
+        \\fn f(optional: ?u8) void {
+        \\    maybe() catch unreachable;
+        \\    _ = optional orelse unreachable;
+        \\    if (optional == null) unreachable;
+        \\}
+        \\
+    ;
+
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+
+    var catch_count: usize = 0;
+    var orelse_count: usize = 0;
+    var generic_count: usize = 0;
+    for (findings.items) |finding| switch (finding.kind) {
+        .catch_unreachable => catch_count += 1,
+        .orelse_unreachable => orelse_count += 1,
+        .unreachable_site => generic_count += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), catch_count);
+    try std.testing.expectEqual(@as(usize, 1), orelse_count);
+    try std.testing.expectEqual(@as(usize, 1), generic_count);
+}
+
+test "ruleset two enforces sharp observations but not ordinary assertions or saturating arithmetic" {
+    inline for (std.meta.tags(Kind)) |kind| {
+        const expected = kind != .debug_assert and kind != .saturating_add_mul;
+        try std.testing.expectEqual(expected, enforcedKind(kind));
+    }
+}
+
+test "unknown acknowledgement rule is rejected" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge definitely_not_a_rule
+        \\// reason: typo must not weaken checking.
+        \\_ = value;
+        \\
+    ;
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    try std.testing.expectEqual(@as(usize, 1), acknowledgements.len);
+    try std.testing.expectEqual(AcknowledgementProblem.unknown_kind, acknowledgements[0].problem);
 }

@@ -1,8 +1,8 @@
 .{
     .name = .zig_audit,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xabd3265873bcd04d,
     .minimum_zig_version = "0.17.0-dev.1980+e78ea8f2c",
     .dependencies = .{},
-    .paths = .{ "AGENTS.md", "LICENSE", "README.md", "build.zig", "build.zig.zon", ".zigversion", "docs", "install", "src" },
+    .paths = .{ ".zig-audit.json", "AGENTS.md", "LICENSE", "README.md", "build.zig", "build.zig.zon", ".zigversion", "docs", "install", "src" },
 }
