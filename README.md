@@ -17,3 +17,9 @@ Output is deterministic:
     path|kind|trimmed source line
 
 The current vocabulary is deliberately small and will change while we dogfood it.
+
+## Lab notes
+
+The user/agent journey, build integration failure cases, source-discovery variants,
+and baseline acknowledgement questions are mapped in `docs/journeys.md`. They are
+working notes, not a frozen architecture.
