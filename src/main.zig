@@ -106,7 +106,7 @@ const Config = struct {
     };
 };
 
-const version = "0.2.0";
+const version = "0.2.1";
 const stable_ruleset: u32 = 2;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
