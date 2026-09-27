@@ -605,3 +605,26 @@ No command should edit product source.
 8. Which new checker rules prove useful enough to keep after a week of ordinary work?
 
 Until those have dogfood answers, keeping the repository small is a feature.
+
+
+## Howl canary evidence, 2026-09-27
+
+The first consumer canary deliberately runs beside Howl's existing local source audit
+rather than replacing it.
+
+Observed:
+
+- the shared checker reproduces Howl's existing 91 stable sensitive-site records;
+- Howl's historical allowlist ordering is locale-sensitive, while zig-audit is
+  bytewise deterministic;
+- canonicalizing both sides proves the records are the same multiset, so `check`
+  now tolerates legacy ordering without forcing a reorder-only adoption commit;
+- `accept` remains the explicit path that can canonicalize a baseline later;
+- with zig-audit installed, Howl's ordinary `zig build audit` passes;
+- with zig-audit absent from PATH, Howl's existing local audit still passes and emits
+  an explicit warning that only the shared canary was skipped;
+- with zig-audit present but its configured baseline unavailable, the Howl audit
+  fails rather than degrading to a warning.
+
+This preserves the useful distinction between bootstrap absence and an installed
+checker that cannot verify.

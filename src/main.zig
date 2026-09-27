@@ -60,6 +60,19 @@ const Token = struct {
     start: usize,
 };
 
+const Config = struct {
+    schema: u32,
+    source: Source,
+    baseline: []const u8,
+
+    const Source = enum {
+        git,
+    };
+};
+
+const config_schema: u32 = 1;
+const default_config_path = ".zig-audit.json";
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
         var buffer: [1024]u8 = undefined;
@@ -72,20 +85,41 @@ pub fn main(init: std.process.Init) void {
 
 fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return error.ExpectedPath;
+    if (args.len < 2) return error.ExpectedCommand;
 
-    var findings: std.ArrayList(Finding) = .empty;
-    defer findings.deinit(init.arena.allocator());
-
-    for (args[1..]) |path| {
-        try scanPath(init.io, init.gpa, init.arena.allocator(), path, &findings);
+    if (std.mem.eql(u8, args[1], "scan")) {
+        if (args.len < 3) return error.ExpectedPath;
+        const findings = try scanPaths(init, args[2..]);
+        return writeFindings(init.io, findings, false);
+    }
+    if (std.mem.eql(u8, args[1], "check")) {
+        if (args.len > 3) return error.InvalidArguments;
+        return checkProject(init, if (args.len == 3) args[2] else default_config_path);
+    }
+    if (std.mem.eql(u8, args[1], "accept")) {
+        if (args.len > 3) return error.InvalidArguments;
+        return acceptProject(init, if (args.len == 3) args[2] else default_config_path);
     }
 
-    std.mem.sort(Finding, findings.items, {}, lessThan);
+    // Keep the original exploratory surface while the command shape is dogfooded.
+    const findings = try scanPaths(init, args[1..]);
+    return writeFindings(init.io, findings, false);
+}
 
+fn scanPaths(init: std.process.Init, paths: []const []const u8) ![]Finding {
+    var findings: std.ArrayList(Finding) = .empty;
+    for (paths) |path| {
+        try scanPath(init.io, init.gpa, init.arena.allocator(), path, &findings);
+    }
+    std.mem.sort(Finding, findings.items, {}, lessThan);
+    return findings.toOwnedSlice(init.arena.allocator());
+}
+
+fn writeFindings(io: std.Io, findings: []const Finding, baseline_only: bool) !void {
     var buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
-    for (findings.items) |finding| {
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    for (findings) |finding| {
+        if (baseline_only and !baselineKind(finding.kind)) continue;
         try stdout.interface.print("{s}|{s}|{s}\n", .{
             finding.path,
             finding.kind.name(),
@@ -93,6 +127,198 @@ fn run(init: std.process.Init) !void {
         });
     }
     try stdout.interface.flush();
+}
+
+fn baselineKind(kind: Kind) bool {
+    return switch (kind) {
+        .any_error, .any_opaque, .any_type, .discard => true,
+        else => false,
+    };
+}
+
+fn loadConfig(init: std.process.Init, path: []const u8) !Config {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        path,
+        init.arena.allocator(),
+        .limited(64 * 1024),
+    );
+    var parsed = std.json.parseFromSlice(
+        Config,
+        init.arena.allocator(),
+        bytes,
+        .{ .ignore_unknown_fields = false },
+    ) catch return error.InvalidConfig;
+    defer parsed.deinit();
+    if (parsed.value.schema != config_schema) return error.UnsupportedConfigSchema;
+    return .{
+        .schema = parsed.value.schema,
+        .source = parsed.value.source,
+        .baseline = try init.arena.allocator().dupe(u8, parsed.value.baseline),
+    };
+}
+
+fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
+    return switch (config.source) {
+        .git => blk: {
+            const result = try std.process.run(init.gpa, init.io, .{
+                .argv = &.{
+                    "git",
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    "*.zig",
+                },
+                .stdout_limit = .limited(16 * 1024 * 1024),
+                .stderr_limit = .limited(64 * 1024),
+            });
+            defer init.gpa.free(result.stdout);
+            defer init.gpa.free(result.stderr);
+            const success = switch (result.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            if (!success) return error.SourceDiscoveryFailed;
+
+            var paths: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, result.stdout, 0);
+            while (it.next()) |path| {
+                if (path.len == 0) continue;
+                try paths.append(init.arena.allocator(), try init.arena.allocator().dupe(u8, path));
+            }
+            break :blk try scanPaths(init, paths.items);
+        },
+    };
+}
+
+fn stableCensus(init: std.process.Init, findings: []const Finding) ![]u8 {
+    var output = try std.Io.Writer.Allocating.initCapacity(init.arena.allocator(), 4096);
+    defer output.deinit();
+    for (findings) |finding| {
+        if (!baselineKind(finding.kind)) continue;
+        try output.writer.print("{s}|{s}|{s}\n", .{
+            finding.path,
+            finding.kind.name(),
+            finding.line,
+        });
+    }
+    return try output.toOwnedSlice();
+}
+
+fn normalizeCensus(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var records: std.ArrayList([]const u8) = .empty;
+    defer records.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try records.append(allocator, line);
+    }
+    std.mem.sort([]const u8, records.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+
+    var output = try std.Io.Writer.Allocating.initCapacity(allocator, bytes.len);
+    defer output.deinit();
+    for (records.items) |record| try output.writer.print("{s}\n", .{record});
+    return try output.toOwnedSlice();
+}
+
+fn checkProject(init: std.process.Init, config_path: []const u8) !void {
+    const config = try loadConfig(init, config_path);
+    const findings = try projectFindings(init, config);
+    const actual = try stableCensus(init, findings);
+    const expected = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        config.baseline,
+        init.arena.allocator(),
+        .limited(16 * 1024 * 1024),
+    ) catch return error.BaselineUnavailable;
+    const normalized_expected = try normalizeCensus(init.arena.allocator(), expected);
+    if (std.mem.eql(u8, normalized_expected, actual)) return;
+
+    try writeCensusDiff(init.io, normalized_expected, actual);
+    return error.CensusChanged;
+}
+
+fn acceptProject(init: std.process.Init, config_path: []const u8) !void {
+    const config = try loadConfig(init, config_path);
+    const findings = try projectFindings(init, config);
+    const actual = try stableCensus(init, findings);
+    try writeAtomic(init.io, init.arena.allocator(), config.baseline, actual);
+}
+
+fn writeCensusDiff(io: std.Io, expected: []const u8, actual: []const u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    try stderr.interface.writeAll("zig-audit: reviewed census changed\n");
+
+    var old = std.mem.splitScalar(u8, expected, '\n');
+    var new = std.mem.splitScalar(u8, actual, '\n');
+    var old_line = nextLine(&old);
+    var new_line = nextLine(&new);
+    while (old_line != null or new_line != null) {
+        if (old_line == null) {
+            try stderr.interface.print("+ {s}\n", .{new_line.?});
+            new_line = nextLine(&new);
+            continue;
+        }
+        if (new_line == null) {
+            try stderr.interface.print("- {s}\n", .{old_line.?});
+            old_line = nextLine(&old);
+            continue;
+        }
+        switch (std.mem.order(u8, old_line.?, new_line.?)) {
+            .eq => {
+                old_line = nextLine(&old);
+                new_line = nextLine(&new);
+            },
+            .lt => {
+                try stderr.interface.print("- {s}\n", .{old_line.?});
+                old_line = nextLine(&old);
+            },
+            .gt => {
+                try stderr.interface.print("+ {s}\n", .{new_line.?});
+                new_line = nextLine(&new);
+            },
+        }
+    }
+    try stderr.interface.writeAll(
+        "Review the source. If the census change is intentional, run: zig-audit accept\n",
+    );
+    try stderr.interface.flush();
+}
+
+fn nextLine(lines: *std.mem.SplitIterator(u8, .scalar)) ?[]const u8 {
+    while (lines.next()) |line| {
+        if (line.len != 0) return line;
+    }
+    return null;
+}
+
+fn writeAtomic(io: std.Io, allocator: Allocator, path: []const u8, bytes: []const u8) !void {
+    const parent_path = std.fs.path.dirname(path) orelse ".";
+    const leaf = std.fs.path.basename(path);
+    var parent = try std.Io.Dir.cwd().openDir(io, parent_path, .{ .iterate = true });
+    defer parent.close(io);
+
+    const temporary = try std.fmt.allocPrint(allocator, ".{s}.zig-audit.tmp", .{leaf});
+    defer allocator.free(temporary);
+    parent.deleteFile(io, temporary) catch {};
+    var file = try parent.createFile(io, temporary, .{ .truncate = true, .exclusive = true });
+    var open = true;
+    defer if (open) file.close(io);
+    errdefer parent.deleteFile(io, temporary) catch {};
+
+    try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+    file.close(io);
+    open = false;
+    try parent.rename(temporary, parent, leaf, io);
 }
 
 fn lessThan(_: void, left: Finding, right: Finding) bool {
@@ -400,4 +626,31 @@ test "escape hatches compose from tokens across whitespace" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "baseline normalization ignores ordering but preserves duplicates" {
+    const source =
+        \\b|discard|_ = b;
+        \\a|anytype|value: anytype,
+        \\a|anytype|value: anytype,
+        \\
+    ;
+    const normalized = try normalizeCensus(std.testing.allocator, source);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings(
+        "a|anytype|value: anytype,\n" ++
+            "a|anytype|value: anytype,\n" ++
+            "b|discard|_ = b;\n",
+        normalized,
+    );
+}
+
+test "stable census vocabulary stays narrower than exploratory scan" {
+    try std.testing.expect(baselineKind(.any_type));
+    try std.testing.expect(baselineKind(.any_error));
+    try std.testing.expect(baselineKind(.any_opaque));
+    try std.testing.expect(baselineKind(.discard));
+    try std.testing.expect(!baselineKind(.empty_catch));
+    try std.testing.expect(!baselineKind(.opaque_type));
+    try std.testing.expect(!baselineKind(.ptr_from_int));
 }
