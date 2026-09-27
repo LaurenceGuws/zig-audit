@@ -64,29 +64,53 @@ const Config = struct {
     schema: u32,
     source: Source,
     baseline: []const u8,
+    minimum_ruleset: u32 = 1,
+    include: []const []const u8 = &.{},
+    exclude: []const []const u8 = &.{},
 
     const Source = enum {
         git,
     };
 };
 
+const version = "0.1.0";
+const stable_ruleset: u32 = 1;
 const config_schema: u32 = 1;
 const default_config_path = ".zig-audit.json";
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
-        var buffer: [1024]u8 = undefined;
-        var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
-        stderr.interface.print("zig-audit: {s}\n", .{@errorName(failure)}) catch {};
-        stderr.interface.flush() catch {};
+        if (failure != error.CensusChanged) emitFailure(init.io, failure);
         std.process.exit(1);
     };
+}
+
+fn emitFailure(io: std.Io, failure: anyerror) void {
+    const message = switch (failure) {
+        error.ExpectedCommand => "expected command: check, accept, scan, or version",
+        error.ExpectedPath => "scan requires at least one Zig file or directory",
+        error.InvalidArguments => "invalid command arguments",
+        error.InvalidConfig => "project config is malformed or contains unsupported fields",
+        error.UnsupportedConfigSchema => "project config schema is newer or unsupported",
+        error.CheckerRulesetTooOld => "checker stable ruleset is older than the project minimum; upgrade zig-audit",
+        error.BaselineUnavailable => "reviewed baseline is unavailable",
+        error.SourceDiscoveryFailed => "configured source discovery failed",
+        else => @errorName(failure),
+    };
+    var buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    stderr.interface.print("zig-audit: {s}\n", .{message}) catch {};
+    stderr.interface.flush() catch {};
 }
 
 fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.ExpectedCommand;
 
+    if (std.mem.eql(u8, args[1], "version")) {
+        if (args.len != 2) return error.InvalidArguments;
+        return writeVersion(init.io);
+    }
     if (std.mem.eql(u8, args[1], "scan")) {
         if (args.len < 3) return error.ExpectedPath;
         const findings = try scanPaths(init, args[2..]);
@@ -129,6 +153,16 @@ fn writeFindings(io: std.Io, findings: []const Finding, baseline_only: bool) !vo
     try stdout.interface.flush();
 }
 
+fn writeVersion(io: std.Io) !void {
+    var buffer: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try stdout.interface.print(
+        "{{\"version\":\"{s}\",\"stable_ruleset\":{d}}}\n",
+        .{ version, stable_ruleset },
+    );
+    try stdout.interface.flush();
+}
+
 fn baselineKind(kind: Kind) bool {
     return switch (kind) {
         .any_error, .any_opaque, .any_type, .discard => true,
@@ -151,11 +185,21 @@ fn loadConfig(init: std.process.Init, path: []const u8) !Config {
     ) catch return error.InvalidConfig;
     defer parsed.deinit();
     if (parsed.value.schema != config_schema) return error.UnsupportedConfigSchema;
+    if (parsed.value.minimum_ruleset > stable_ruleset) return error.CheckerRulesetTooOld;
     return .{
         .schema = parsed.value.schema,
         .source = parsed.value.source,
         .baseline = try init.arena.allocator().dupe(u8, parsed.value.baseline),
+        .minimum_ruleset = parsed.value.minimum_ruleset,
+        .include = try dupeStrings(init.arena.allocator(), parsed.value.include),
+        .exclude = try dupeStrings(init.arena.allocator(), parsed.value.exclude),
     };
+}
+
+fn dupeStrings(allocator: Allocator, values: []const []const u8) ![]const []const u8 {
+    const copy = try allocator.alloc([]const u8, values.len);
+    for (values, 0..) |value, index| copy[index] = try allocator.dupe(u8, value);
+    return copy;
 }
 
 fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
@@ -186,12 +230,37 @@ fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
             var paths: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, result.stdout, 0);
             while (it.next()) |path| {
-                if (path.len == 0) continue;
+                if (path.len == 0 or !sourceSelected(config, path)) continue;
                 try paths.append(init.arena.allocator(), try init.arena.allocator().dupe(u8, path));
             }
             break :blk try scanPaths(init, paths.items);
         },
     };
+}
+
+fn sourceSelected(config: Config, path: []const u8) bool {
+    if (config.include.len != 0) {
+        var included = false;
+        for (config.include) |root| {
+            if (pathUnder(root, path)) {
+                included = true;
+                break;
+            }
+        }
+        if (!included) return false;
+    }
+    for (config.exclude) |root| {
+        if (pathUnder(root, path)) return false;
+    }
+    return true;
+}
+
+fn pathUnder(root: []const u8, path: []const u8) bool {
+    if (root.len == 0) return false;
+    if (std.mem.eql(u8, root, path)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (root[root.len - 1] == '/') return true;
+    return path.len > root.len and path[root.len] == '/';
 }
 
 fn stableCensus(init: std.process.Init, findings: []const Finding) ![]u8 {
@@ -653,4 +722,24 @@ test "stable census vocabulary stays narrower than exploratory scan" {
     try std.testing.expect(!baselineKind(.empty_catch));
     try std.testing.expect(!baselineKind(.opaque_type));
     try std.testing.expect(!baselineKind(.ptr_from_int));
+}
+
+test "source scope uses exact roots and directory prefixes" {
+    const config = Config{
+        .schema = 1,
+        .source = .git,
+        .baseline = "baseline",
+        .include = &.{ "build.zig", "src", "tools/check.zig" },
+        .exclude = &.{"src/vendor"},
+    };
+    try std.testing.expect(sourceSelected(config, "build.zig"));
+    try std.testing.expect(sourceSelected(config, "src/main.zig"));
+    try std.testing.expect(sourceSelected(config, "tools/check.zig"));
+    try std.testing.expect(!sourceSelected(config, "src/vendor/lib.zig"));
+    try std.testing.expect(!sourceSelected(config, "vendor/lib.zig"));
+    try std.testing.expect(!sourceSelected(config, "build.zig.zon"));
+}
+
+test "minimum ruleset rejects a stale checker contract" {
+    try std.testing.expect(stable_ruleset >= 1);
 }

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+cd "$root"
+
+zig=${ZIG:-$(command -v zig || true)}
+[[ -n "$zig" ]] || { echo 'zig-audit install: zig not found in PATH' >&2; exit 1; }
+
+expected=$(<.zigversion)
+actual=$("$zig" version)
+[[ "$actual" == "$expected" ]] || {
+  printf 'zig-audit install: Zig mismatch: expected %s, got %s\n' "$expected" "$actual" >&2
+  exit 1
+}
+
+"$zig" build test
+"$zig" build install -Doptimize=ReleaseSafe --prefix "$HOME/.local"
+"$HOME/.local/bin/zig-audit" version
