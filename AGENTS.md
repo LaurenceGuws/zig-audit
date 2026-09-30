@@ -17,7 +17,7 @@ the architecture, style, or policy of consuming projects.
 - `check` is read-only.
 - One acknowledgement consumes one exact finding and must fail when stale or bound to
   the wrong rule.
-- Successful acknowledgements remain visible on stderr.
+- Ordinary `check` stays concise: successful acknowledgements are summarized, while `-v` / `--verbose` emits every accepted site for manual review.
 - A newer enforced rule increments `stable_ruleset` when an older checker could
   otherwise produce materially weaker coverage.
 - Preserve deterministic scan output and duplicate findings.

@@ -106,11 +106,21 @@ const Config = struct {
     };
 };
 
-const version = "0.2.1";
+const version = "0.2.2";
 const stable_ruleset: u32 = 2;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
 const default_config_path = ".zig-audit.json";
+
+const CheckOptions = struct {
+    config_path: []const u8 = default_config_path,
+    verbose: bool = false,
+};
+
+const CheckSummary = struct {
+    acknowledged: usize = 0,
+    files: usize = 0,
+};
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
@@ -161,8 +171,8 @@ fn run(init: std.process.Init) !void {
         return writeFindings(init.io, findings);
     }
     if (std.mem.eql(u8, args[1], "check")) {
-        if (args.len > 3) return error.InvalidArguments;
-        return checkProject(init, if (args.len == 3) args[2] else default_config_path);
+        const options = try parseCheckOptions(args[2..]);
+        return checkProject(init, options);
     }
     if (std.mem.eql(u8, args[1], "accept")) {
         if (args.len > 3) return error.InvalidArguments;
@@ -172,6 +182,22 @@ fn run(init: std.process.Init) !void {
     // Keep the original exploratory surface while the command shape is dogfooded.
     const findings = try scanPaths(init, args[1..]);
     return writeFindings(init.io, findings);
+}
+
+fn parseCheckOptions(args: []const []const u8) !CheckOptions {
+    var result = CheckOptions{};
+    var config_seen = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            if (result.verbose) return error.InvalidArguments;
+            result.verbose = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-") or config_seen) return error.InvalidArguments;
+        result.config_path = arg;
+        config_seen = true;
+    }
+    return result;
 }
 
 fn scanPaths(init: std.process.Init, paths: []const []const u8) ![]Finding {
@@ -359,10 +385,10 @@ fn normalizeCensus(allocator: Allocator, bytes: []const u8) ![]u8 {
     return try output.toOwnedSlice();
 }
 
-fn checkProject(init: std.process.Init, config_path: []const u8) !void {
-    const config = try loadConfig(init, config_path);
+fn checkProject(init: std.process.Init, options: CheckOptions) !void {
+    const config = try loadConfig(init, options.config_path);
     if (config.schema == legacy_config_schema) return checkLegacyProject(init, config);
-    return checkAcknowledgedProject(init, config);
+    return checkAcknowledgedProject(init, config, options.verbose);
 }
 
 fn checkLegacyProject(init: std.process.Init, config: Config) !void {
@@ -389,11 +415,12 @@ fn acceptProject(init: std.process.Init, config_path: []const u8) !void {
     try writeAtomic(init.io, init.arena.allocator(), config.baseline.?, actual);
 }
 
-fn checkAcknowledgedProject(init: std.process.Init, config: Config) !void {
+fn checkAcknowledgedProject(init: std.process.Init, config: Config, verbose: bool) !void {
     const paths = try projectPaths(init, config);
     var stderr_buffer: [4096]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
     var failed = false;
+    var summary = CheckSummary{};
 
     for (paths) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -412,13 +439,18 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config) !void {
         @memset(matched, false);
         const resolutions = try init.arena.allocator().alloc(AcknowledgementResolution, acknowledgements.len);
         resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+        var file_acknowledged = false;
 
         for (acknowledgements, resolutions) |ack, resolution| {
             switch (resolution) {
-                .acknowledged => try stderr.interface.print(
-                    "ACK {s}:{d} {s}: {s}\n",
-                    .{ path, ack.target_line, ack.kind.?.name(), ack.reason },
-                ),
+                .acknowledged => {
+                    summary.acknowledged += 1;
+                    file_acknowledged = true;
+                    if (verbose) try stderr.interface.print(
+                        "ACK {s}:{d} {s}: {s}\n",
+                        .{ path, ack.target_line, ack.kind.?.name(), ack.reason },
+                    );
+                },
                 .unknown_kind => {
                     failed = true;
                     try stderr.interface.print(
@@ -456,6 +488,7 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config) !void {
                 },
             }
         }
+        if (file_acknowledged) summary.files += 1;
 
         for (findings.items, matched) |finding, acknowledged| {
             if (!enforcedKind(finding.kind) or acknowledged) continue;
@@ -467,8 +500,20 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config) !void {
         }
     }
 
+    if (!failed) try writeCheckSummary(&stderr.interface, summary);
     try stderr.interface.flush();
     if (failed) return error.AuditFailed;
+}
+
+fn writeCheckSummary(writer: *std.Io.Writer, summary: CheckSummary) !void {
+    try writer.print(
+        "zig-audit: PASS {d} acknowledged / {d} {s}\n",
+        .{
+            summary.acknowledged,
+            summary.files,
+            if (summary.files == 1) "file" else "files",
+        },
+    );
 }
 
 fn parseAcknowledgements(allocator: Allocator, source: []const u8) ![]Acknowledgement {
@@ -1201,4 +1246,50 @@ test "unknown acknowledgement rule is rejected" {
     defer std.testing.allocator.free(acknowledgements);
     try std.testing.expectEqual(@as(usize, 1), acknowledgements.len);
     try std.testing.expectEqual(AcknowledgementProblem.unknown_kind, acknowledgements[0].problem);
+}
+
+test "check options are quiet by default and accept verbose aliases" {
+    const quiet = try parseCheckOptions(&.{});
+    try std.testing.expectEqualStrings(default_config_path, quiet.config_path);
+    try std.testing.expect(!quiet.verbose);
+
+    const short = try parseCheckOptions(&.{"-v"});
+    try std.testing.expectEqualStrings(default_config_path, short.config_path);
+    try std.testing.expect(short.verbose);
+
+    const long = try parseCheckOptions(&.{ "--verbose", "project.json" });
+    try std.testing.expectEqualStrings("project.json", long.config_path);
+    try std.testing.expect(long.verbose);
+
+    const reordered = try parseCheckOptions(&.{ "project.json", "-v" });
+    try std.testing.expectEqualStrings("project.json", reordered.config_path);
+    try std.testing.expect(reordered.verbose);
+
+    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{ "-v", "--verbose" }));
+    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{"--unknown"}));
+    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{ "one.json", "two.json" }));
+}
+
+test "quiet check summary stays compact" {
+    var output = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 64);
+    defer output.deinit();
+
+    try writeCheckSummary(&output.writer, .{ .acknowledged = 317, .files = 32 });
+    const text_value = try output.toOwnedSlice();
+    defer std.testing.allocator.free(text_value);
+
+    try std.testing.expectEqualStrings(
+        "zig-audit: PASS 317 acknowledged / 32 files\n",
+        text_value,
+    );
+
+    var singular = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 64);
+    defer singular.deinit();
+    try writeCheckSummary(&singular.writer, .{ .acknowledged = 4, .files = 1 });
+    const singular_text = try singular.toOwnedSlice();
+    defer std.testing.allocator.free(singular_text);
+    try std.testing.expectEqualStrings(
+        "zig-audit: PASS 4 acknowledged / 1 file\n",
+        singular_text,
+    );
 }

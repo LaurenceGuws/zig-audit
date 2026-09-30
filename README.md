@@ -12,11 +12,18 @@ From a configured project root:
 
     zig-audit check
 
-A clean acknowledged site is still visible:
+A clean check is deliberately compact:
 
+    zig-audit: PASS 17 acknowledged / 4 files
+
+For Captain's manual red-pen pass, `-v` / `--verbose` prints every accepted
+acknowledgement before the same summary:
+
+    zig-audit check -v
     ACK src/window.zig:42 opaque_type: SDL owns this ABI handle layout.
+    zig-audit: PASS 17 acknowledged / 4 files
 
-An unacknowledged sharp construct fails:
+An unacknowledged sharp construct stays fully explicit in either mode:
 
     ERROR src/main.zig:17 discard: acknowledgement required
 
@@ -46,7 +53,7 @@ The contract is intentionally strict:
 - a wrong-rule marker fails;
 - a stale marker fails;
 - an acknowledgement never suppresses a different source line;
-- every successful acknowledgement is emitted to stderr as `ACK`.
+- every successful acknowledgement is counted in the default summary and emitted individually as `ACK` with `-v` / `--verbose`.
 
 There are no project-local rule overrides in schema 2.
 
