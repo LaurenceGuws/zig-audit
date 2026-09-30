@@ -7,7 +7,7 @@ the architecture, style, or policy of consuming projects.
 ## Boundaries
 
 - Use Zig's tokenizer for Zig syntax awareness. Do not grow a parallel regex parser.
-- Enforced rules are generic Zig observations that merit explicit local review.
+- Enforced rules are generic Zig observations. Sharp constructs may require explicit local review; structural contract failures may be fix-only.
 - Intentional findings are acknowledged beside source with an exact rule marker and
   non-empty reason. Do not add new baseline/allowlist mechanisms.
 - Schema 1 baseline support is migration compatibility only. New integrations use
@@ -15,8 +15,7 @@ the architecture, style, or policy of consuming projects.
 - Project config may describe source scope and minimum checker ruleset. Do not add
   product-specific nouns, regex exceptions, or architecture rules.
 - `check` is read-only.
-- One acknowledgement consumes one exact finding and must fail when stale or bound to
-  the wrong rule.
+- One acknowledgement consumes one exact acknowledgeable finding and must fail when stale or bound to the wrong rule. Fix-only rules such as `pub_without_doc` must never gain acknowledgement escapes.
 - Ordinary `check` stays concise: successful acknowledgements are summarized, while `-v` / `--verbose` emits every accepted site for manual review.
 - A newer enforced rule increments `stable_ruleset` when an older checker could
   otherwise produce materially weaker coverage.

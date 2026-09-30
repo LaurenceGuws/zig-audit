@@ -20,6 +20,7 @@ const Kind = enum {
     panic,
     ptr_cast,
     ptr_from_int,
+    pub_without_doc,
     runtime_safety_off,
     saturating_add_mul,
     unreachable_site,
@@ -41,6 +42,7 @@ const Kind = enum {
             .panic => "panic",
             .ptr_cast => "ptr_cast",
             .ptr_from_int => "ptr_from_int",
+            .pub_without_doc => "pub_without_doc",
             .runtime_safety_off => "runtime_safety_off",
             .saturating_add_mul => "saturating_add_mul",
             .unreachable_site => "unreachable",
@@ -91,6 +93,7 @@ const AcknowledgementResolution = enum {
     unknown_kind,
     missing_reason,
     empty_reason,
+    not_acknowledgeable,
 };
 
 const Config = struct {
@@ -106,8 +109,8 @@ const Config = struct {
     };
 };
 
-const version = "0.2.2";
-const stable_ruleset: u32 = 2;
+const version = "0.3.0";
+const stable_ruleset: u32 = 3;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
 const default_config_path = ".zig-audit.json";
@@ -122,6 +125,7 @@ const CheckSummary = struct {
     files: usize = 0,
 };
 
+/// Runs the zig-audit command-line checker.
 pub fn main(init: std.process.Init) void {
     run(init) catch |failure| {
         if (failure != error.CensusChanged and failure != error.AuditFailed)
@@ -244,6 +248,10 @@ fn enforcedKind(kind: Kind) bool {
         .debug_assert, .saturating_add_mul => false,
         else => true,
     };
+}
+
+fn acknowledgeableKind(kind: Kind) bool {
+    return kind != .pub_without_doc;
 }
 
 fn loadConfig(init: std.process.Init, path: []const u8) !Config {
@@ -486,6 +494,13 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config, verbose: boo
                         .{ path, ack.marker_line, ack.kind_text, ack.target_line },
                     );
                 },
+                .not_acknowledgeable => {
+                    failed = true;
+                    try stderr.interface.print(
+                        "ERROR {s}:{d} {s}: this rule cannot be acknowledged; add /// documentation\n",
+                        .{ path, ack.marker_line, ack.kind_text },
+                    );
+                },
             }
         }
         if (file_acknowledged) summary.files += 1;
@@ -493,10 +508,17 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config, verbose: boo
         for (findings.items, matched) |finding, acknowledged| {
             if (!enforcedKind(finding.kind) or acknowledged) continue;
             failed = true;
-            try stderr.interface.print(
-                "ERROR {s}:{d} {s}: acknowledgement required\n",
-                .{ path, finding.line_number, finding.kind.name() },
-            );
+            if (finding.kind == .pub_without_doc) {
+                try stderr.interface.print(
+                    "ERROR {s}:{d} pub_without_doc: public declaration requires /// documentation\n",
+                    .{ path, finding.line_number },
+                );
+            } else {
+                try stderr.interface.print(
+                    "ERROR {s}:{d} {s}: acknowledgement required\n",
+                    .{ path, finding.line_number, finding.kind.name() },
+                );
+            }
         }
     }
 
@@ -600,6 +622,16 @@ fn resolveAcknowledgements(
             .missing_reason => .missing_reason,
             .empty_reason => .empty_reason,
             .none => blk: {
+                if (!acknowledgeableKind(ack.kind.?)) {
+                    for (findings, matched, 0..) |finding, acknowledged, index| {
+                        if (acknowledged or finding.line_number != ack.target_line) continue;
+                        if (finding.kind == ack.kind.?) {
+                            matched[index] = true;
+                            break;
+                        }
+                    }
+                    break :blk .not_acknowledgeable;
+                }
                 var other_unmatched = false;
                 for (findings, matched, 0..) |finding, acknowledged, index| {
                     if (!enforcedKind(finding.kind) or finding.line_number != ack.target_line or acknowledged)
@@ -775,12 +807,48 @@ fn scanFile(
     try scanSource(arena, path, source, findings);
 }
 
+fn scanPublicDocumentation(
+    allocator: Allocator,
+    path: []const u8,
+    source: [:0]const u8,
+    findings: *std.ArrayList(Finding),
+) !void {
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var previous_tag: ?std.zig.Token.Tag = null;
+
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        if (token.tag == .keyword_pub and previous_tag != .doc_comment) {
+            var lookahead = tokenizer;
+            if (!isBuildEntrypoint(path, source, &lookahead))
+                try add(allocator, path, source, token.loc.start, .pub_without_doc, findings);
+        }
+        previous_tag = token.tag;
+    }
+}
+
+fn isBuildEntrypoint(
+    path: []const u8,
+    source: []const u8,
+    tokenizer: *std.zig.Tokenizer,
+) bool {
+    if (!std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) return false;
+    const fn_token = tokenizer.next();
+    if (fn_token.tag != .keyword_fn) return false;
+    const name_token = tokenizer.next();
+    return name_token.tag == .identifier and
+        std.mem.eql(u8, source[name_token.loc.start..name_token.loc.end], "build");
+}
+
 fn scanSource(
     allocator: Allocator,
     path: []const u8,
     source: [:0]const u8,
     findings: *std.ArrayList(Finding),
 ) !void {
+    try scanPublicDocumentation(allocator, path, source, findings);
+
     var tokens: std.ArrayList(Token) = .empty;
     defer tokens.deinit(allocator);
 
@@ -1228,11 +1296,13 @@ test "specific unreachable forms do not double report generic unreachable" {
     try std.testing.expectEqual(@as(usize, 1), generic_count);
 }
 
-test "ruleset two enforces sharp observations but not ordinary assertions or saturating arithmetic" {
+test "ruleset three enforces public docs and sharp observations" {
     inline for (std.meta.tags(Kind)) |kind| {
         const expected = kind != .debug_assert and kind != .saturating_add_mul;
         try std.testing.expectEqual(expected, enforcedKind(kind));
     }
+    try std.testing.expect(!acknowledgeableKind(.pub_without_doc));
+    try std.testing.expect(acknowledgeableKind(.discard));
 }
 
 test "unknown acknowledgement rule is rejected" {
@@ -1292,4 +1362,102 @@ test "quiet check summary stays compact" {
         "zig-audit: PASS 4 acknowledged / 1 file\n",
         singular_text,
     );
+}
+
+test "public declaration requires doc comment" {
+    const source: [:0]const u8 =
+        \\pub const Missing = struct {};
+        \\/// Documented declaration.
+        \\pub fn documented() void {}
+        \\
+    ;
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+
+    var missing: usize = 0;
+    for (findings.items) |finding| {
+        if (finding.kind == .pub_without_doc) {
+            missing += 1;
+            try std.testing.expectEqual(@as(usize, 1), finding.line_number);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing);
+}
+
+test "container and ordinary comments do not document public declarations" {
+    const source: [:0]const u8 =
+        \\//! Container documentation.
+        \\pub const ContainerOnly = u8;
+        \\/// Interrupted documentation.
+        \\// ordinary comment breaks declaration adjacency
+        \\pub const Interrupted = u8;
+        \\
+    ;
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+
+    var missing: usize = 0;
+    for (findings.items) |finding| {
+        if (finding.kind == .pub_without_doc) missing += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing);
+}
+
+test "public documentation rule cannot be acknowledged away" {
+    const source: [:0]const u8 =
+        \\// zig-audit: acknowledge pub_without_doc
+        \\// reason: this must still require documentation.
+        \\pub const Missing = u8;
+        \\
+    ;
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "fixture.zig", source, &findings);
+    const acknowledgements = try parseAcknowledgements(std.testing.allocator, source);
+    defer std.testing.allocator.free(acknowledgements);
+    const matched = try std.testing.allocator.alloc(bool, findings.items.len);
+    defer std.testing.allocator.free(matched);
+    @memset(matched, false);
+    const resolutions = try std.testing.allocator.alloc(AcknowledgementResolution, acknowledgements.len);
+    defer std.testing.allocator.free(resolutions);
+
+    resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
+    try std.testing.expectEqual(AcknowledgementResolution.not_acknowledgeable, resolutions[0]);
+}
+
+test "canonical build.zig entrypoint is not public API documentation" {
+    const source: [:0]const u8 =
+        \\pub fn build(_: *std.Build) void {}
+        \\pub const Other = u8;
+        \\
+    ;
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "build.zig", source, &findings);
+
+    var missing: usize = 0;
+    for (findings.items) |finding| {
+        if (finding.kind != .pub_without_doc) continue;
+        missing += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.line, "Other") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing);
+}
+
+test "build-named function outside build.zig still requires documentation" {
+    const source: [:0]const u8 =
+        \\pub fn build() void {}
+        \\
+    ;
+    var findings: std.ArrayList(Finding) = .empty;
+    defer findings.deinit(std.testing.allocator);
+    try scanSource(std.testing.allocator, "src/api.zig", source, &findings);
+
+    var missing: usize = 0;
+    for (findings.items) |finding| if (finding.kind == .pub_without_doc) {
+        missing += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), missing);
 }

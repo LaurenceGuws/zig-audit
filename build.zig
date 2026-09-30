@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+/// Defines zig-audit build, test, and self-audit steps.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

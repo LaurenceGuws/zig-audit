@@ -57,9 +57,22 @@ The contract is intentionally strict:
 
 There are no project-local rule overrides in schema 2.
 
-## Enforced ruleset 2
+## Enforced ruleset 3
 
-Ruleset 2 requires acknowledgements for:
+Ruleset 3 keeps the reviewed sharp-edge rules from ruleset 2 and adds one
+fix-only structural rule:
+
+- every `pub` declaration must have attached Zig `///` documentation;
+- `//!` container documentation does not document a declaration;
+- ordinary `//` comments and zig-audit acknowledgement metadata are transparent
+  because Zig's tokenizer does not make them declaration tokens;
+- the canonical `pub fn build` entrypoint in `build.zig` is exempt as build-system
+  plumbing;
+- `pub_without_doc` cannot be acknowledged away. Add documentation or make the
+  declaration non-public.
+
+The source-acknowledgeable rules remain:
+
 
 - `anytype`, `anyerror`, and `anyopaque`
 - result discard assignments (`_ = ...`)
@@ -85,7 +98,7 @@ The current config schema is 2:
     {
       "schema": 2,
       "source": "git",
-      "minimum_ruleset": 2,
+      "minimum_ruleset": 3,
       "include": ["build.zig", "src", "tests"],
       "exclude": ["src/vendor"]
     }
