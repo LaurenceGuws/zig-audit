@@ -300,7 +300,7 @@ def prepare(args):
         if step:
             argv.append(step)
         return argv + [f"-j{args.jobs}", "-Doptimize=ReleaseSafe", f"-Dtarget={target}",
-                       "-Dcpu=baseline", "--prefix", work / ("build-" + target)]
+                       "-Dcpu=baseline", "-Dstrip=true", "--prefix", work / ("build-" + target)]
 
     native_gates = {"target": native}
     native_gates["diff_check"], _ = gates.run("diff-check", ["git", "diff", "--check"], checkout)
@@ -321,6 +321,10 @@ def prepare(args):
             target_gates["build"], _ = gates.run("cross-build", build(target), checkout)
         candidate = work / ("build-" + target) / "bin/zig-audit"
         target_gates["elf"] = verify_elf(candidate, target, gates, checkout)
+        payload = candidate.read_bytes()
+        require(str(work).encode() not in payload and str(zig.parent.parent).encode() not in payload,
+                "release payload exposes private build/compiler paths")
+        target_gates["private_paths"] = {"status": "passed", "debug_information": "stripped"}
         base = f"zig-audit-{version}-{target}"
         archive = work / (base + ".tar.xz")
         extracted = work / ("extracted-" + target)
@@ -339,7 +343,7 @@ def prepare(args):
                     "gates": {"native": native_gates, "target": target_gates},
                     "runtime_dependencies": ["git (configured source: git audits)"],
                     "builder": {"architecture": arch, "jobs": args.jobs,
-                                "optimization": "ReleaseSafe", "started_at": started,
+                                "optimization": "ReleaseSafe", "strip": True, "started_at": started,
                                 "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                                 "fleet": fleet_evidence,
                                 "reproducibility": "not-claimed"}}

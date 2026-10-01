@@ -6,12 +6,14 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip executable debug information") orelse false;
     const self_hosted = target.result.cpu.arch == .x86_64;
 
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     const executable = b.addExecutable(.{
         .name = "zig-audit",

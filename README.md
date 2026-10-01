@@ -122,7 +122,7 @@ unavailable for schema 2.
 
 The installer consumes prebuilt releases. It never invokes Zig, builds source,
 uses sudo, or silently selects latest. Linux x86_64 and AArch64 payloads use
-baseline CPUs and static ELF executables. The installer requires Python 3
+baseline CPUs and stripped static ELF executables. The installer requires Python 3
 (standard library only). Configured Git-source audits still require Git.
 
 First obtain the exact manifest SHA-256 from reviewed, trusted release metadata.
