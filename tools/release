@@ -300,9 +300,7 @@ def prepare(args):
         if step:
             argv.append(step)
         return argv + [f"-j{args.jobs}", "-Doptimize=ReleaseSafe", f"-Dtarget={target}",
-                       "-Dcpu=baseline", "--prefix", work / ("build-" + target),
-                       "--cache-dir", work / ("cache-" + target),
-                       "--global-cache-dir", work / "global-cache"]
+                       "-Dcpu=baseline", "--prefix", work / ("build-" + target)]
 
     native_gates = {"target": native}
     native_gates["diff_check"], _ = gates.run("diff-check", ["git", "diff", "--check"], checkout)
