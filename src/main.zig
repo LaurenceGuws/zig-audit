@@ -109,7 +109,7 @@ const Config = struct {
     };
 };
 
-const version = "0.3.0";
+const version = "0.3.1";
 const stable_ruleset: u32 = 3;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
@@ -165,7 +165,7 @@ fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.ExpectedCommand;
 
-    if (std.mem.eql(u8, args[1], "version")) {
+    if (isVersionCommand(args[1])) {
         if (args.len != 2) return error.InvalidArguments;
         return writeVersion(init.io);
     }
@@ -186,6 +186,20 @@ fn run(init: std.process.Init) !void {
     // Keep the original exploratory surface while the command shape is dogfooded.
     const findings = try scanPaths(init, args[1..]);
     return writeFindings(init.io, findings);
+}
+
+fn isVersionCommand(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version");
+}
+
+test "standalone version aliases do not change check verbosity" {
+    try std.testing.expect(isVersionCommand("version"));
+    try std.testing.expect(isVersionCommand("-v"));
+    try std.testing.expect(isVersionCommand("--version"));
+    try std.testing.expect(!isVersionCommand("check"));
+    try std.testing.expect(!isVersionCommand("--verbose"));
+    const options = try parseCheckOptions(&.{"-v"});
+    try std.testing.expect(options.verbose);
 }
 
 fn parseCheckOptions(args: []const []const u8) !CheckOptions {

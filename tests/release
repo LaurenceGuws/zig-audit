@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""Isolated, compiler-free release installer acceptance (Python 3 stdlib only).
+
+All writes and test prefixes remain below --work in a unique retained run directory.
+Supply a real host-native release archive and manifest; no shell script is presented
+as a conforming payload. Adversarial cases derive from that accepted ELF. Supply a
+second, distinct conforming release with --previous-* to exercise upgrade/rollback.
+This never downloads, builds, publishes, or activates the user's live installation.
+"""
+
+import argparse
+import copy
+import hashlib
+import io
+import json
+import lzma
+import os
+import runpy
+from pathlib import Path
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import unittest
+import types
+import zlib
+
+
+HERE = Path(__file__).resolve().parent.parent
+INSTALL = HERE / "install"
+OPTIONS = None
+RUN = None
+BASE = None
+PREVIOUS = None
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key: " + key)
+        result[key] = value
+    return result
+
+
+def read_manifest(path):
+    return json.loads(path.read_bytes(), object_pairs_hook=strict_object)
+
+
+def load_artifact(archive, manifest):
+    archive, manifest = Path(archive).resolve(), Path(manifest).resolve()
+    value = read_manifest(manifest)
+    archive_bytes = archive.read_bytes()
+    expected = value["archive"]
+    if archive.name != expected["name"]:
+        raise ValueError("input archive basename disagrees with manifest")
+    if digest(archive_bytes) != expected["sha256"] or len(archive_bytes) != expected["size"]:
+        raise ValueError("input archive hash/size disagrees with manifest")
+    with tarfile.open(archive, "r:xz") as tf:
+        members = tf.getmembers()
+        if sorted(m.name for m in members) != ["LICENSE", "bin/zig-audit"]:
+            raise ValueError("input archive must contain exactly LICENSE and bin/zig-audit")
+        if not all(m.isfile() for m in members):
+            raise ValueError("input archive members must be regular files")
+        payload = tf.extractfile("bin/zig-audit").read()
+        license_bytes = tf.extractfile("LICENSE").read()
+    if not payload.startswith(b"\x7fELF"):
+        raise ValueError("input payload must be a real ELF, not a script fixture")
+    executable = value["executable"]
+    if digest(payload) != executable["sha256"] or len(payload) != executable["size"]:
+        raise ValueError("input executable hash/size disagrees with manifest")
+    return {"archive": archive, "manifest": manifest, "value": value,
+            "payload": payload, "license": license_bytes}
+
+
+def snapshot(path):
+    """Capture bytes, link targets, modes, owners, and mtimes without following links."""
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return None
+    result = {}
+    paths = [path]
+    if path.is_dir() and not path.is_symlink():
+        paths.extend(sorted(path.rglob("*")))
+    for entry in paths:
+        info = entry.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            content = ("link", os.readlink(entry))
+        elif stat.S_ISREG(info.st_mode):
+            content = ("file", digest(entry.read_bytes()))
+        elif stat.S_ISDIR(info.st_mode):
+            content = ("directory",)
+        else:
+            content = ("other",)
+        result[str(entry.relative_to(path))] = (
+            stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid, info.st_mtime_ns,
+            info.st_size if not stat.S_ISDIR(info.st_mode) else None, content)
+    return result
+
+
+class Acceptance(unittest.TestCase):
+    def setUp(self):
+        if BASE is None:
+            self.skipTest("NOT RUN: provide --archive and --manifest for real ELF acceptance")
+        self.root = RUN / self.id().split(".")[-1]
+        self.root.mkdir(mode=0o700)
+        self.prefix = self.root / "prefix"
+        self.home = self.root / "home"
+        self.home.mkdir(mode=0o700)
+        self.tmp = self.root / "tmp"
+        self.tmp.mkdir(mode=0o700)
+        self.path = self.root / "no-compiler-bin"
+        self.path.mkdir(mode=0o700)
+        (self.path / "python3").symlink_to(Path(sys.executable).resolve())
+        self.env = {"HOME": str(self.home), "PATH": str(self.path),
+                    "TMPDIR": str(self.tmp), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        self.serial = 0
+        self.commands = self.root / "commands.jsonl"
+
+    def run_command(self, argv, success=True, env=None, timeout=30):
+        started = time.monotonic()
+        try:
+            result = subprocess.run([str(x) for x in argv], cwd=self.root,
+                                    env=env or self.env, capture_output=True,
+                                    text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            self.fail("command timed out: " + str(error))
+        with self.commands.open("a") as output:
+            output.write(json.dumps({"argv": [str(x) for x in argv],
+                                     "returncode": result.returncode,
+                                     "stdout": result.stdout, "stderr": result.stderr,
+                                     "seconds": round(time.monotonic() - started, 3)}) + "\n")
+        detail = "command: %r\nstdout: %s\nstderr: %s" % (argv, result.stdout, result.stderr)
+        if success:
+            self.assertEqual(result.returncode, 0, detail)
+        else:
+            self.assertNotEqual(result.returncode, 0, detail)
+        return result
+
+    def install_args(self, artifact=None, prefix=None):
+        artifact = artifact or BASE
+        return [INSTALL, "--archive", artifact["archive"],
+                "--manifest", artifact["manifest"], "--manifest-sha256",
+                digest(artifact["manifest"].read_bytes()),
+                "--prefix", prefix or self.prefix]
+
+    def install(self, artifact=None, prefix=None, success=True):
+        return self.run_command(self.install_args(artifact, prefix), success=success)
+
+    def rollback(self, artifact, success=True):
+        return self.run_command([INSTALL, "--rollback", artifact["value"]["release_id"],
+                                 "--prefix", self.prefix], success=success)
+
+    def tree(self, artifact=None):
+        return self.prefix / "share/zig-audit/releases" / (artifact or BASE)["value"]["release_id"]
+
+    def launcher(self):
+        return self.prefix / "bin/zig-audit"
+
+    def aliases(self, executable, artifact=None):
+        value = (artifact or BASE)["value"]
+        outputs = []
+        for alias in ("-v", "--version", "version"):
+            result = self.run_command([executable, alias])
+            self.assertEqual(result.stderr, "", "version alias emitted stderr")
+            identity = json.loads(result.stdout, object_pairs_hook=strict_object)
+            self.assertEqual(identity["version"], value["version"])
+            self.assertEqual(identity["stable_ruleset"], value["stable_ruleset"])
+            outputs.append(result.stdout)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[1], outputs[2])
+
+    def altered(self, mutate=None, members=None, payload=None, raw_manifest=None):
+        """Local adversarial fixture derived from the supplied release; never publishable."""
+        self.serial += 1
+        root = self.root / ("adversarial-%02d" % self.serial)
+        root.mkdir(mode=0o700)
+        value = copy.deepcopy(BASE["value"])
+        data = BASE["payload"] if payload is None else payload
+        archive = root / value["archive"]["name"]
+        if members is None:
+            members = [("bin/zig-audit", data, tarfile.REGTYPE, "", 0o755),
+                       ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+        with tarfile.open(archive, "w:xz", format=tarfile.USTAR_FORMAT, preset=1) as tf:
+            for name, content, kind, link, mode in members:
+                info = tarfile.TarInfo(name)
+                info.type, info.linkname, info.mode = kind, link, mode
+                info.uid = info.gid = 0
+                info.mtime = 0
+                info.size = len(content) if kind == tarfile.REGTYPE else 0
+                tf.addfile(info, io.BytesIO(content) if info.size else None)
+        value["archive"].update(sha256=digest(archive.read_bytes()), size=archive.stat().st_size)
+        value["executable"].update(sha256=digest(data), size=len(data))
+        if mutate:
+            mutate(value)
+        manifest = root / "manifest.json"
+        encoded = json.dumps(value, sort_keys=True).encode() + b"\n"
+        manifest.write_bytes(raw_manifest(value, encoded) if raw_manifest else encoded)
+        return {"archive": archive, "manifest": manifest, "value": value}
+
+    def reject(self, artifact, prefix=None):
+        prefix = prefix or self.prefix
+        before = snapshot(prefix / "bin/zig-audit")
+        self.install(artifact, prefix=prefix, success=False)
+        self.assertEqual(snapshot(prefix / "bin/zig-audit"), before,
+                         "rejected candidate changed the command launcher")
+
+    def need_previous(self):
+        if PREVIOUS is None:
+            self.skipTest("NOT RUN: two distinct conforming releases require --previous-archive/--previous-manifest")
+        self.assertNotEqual(PREVIOUS["value"]["release_id"], BASE["value"]["release_id"])
+        self.assertNotEqual(PREVIOUS["value"]["version"], BASE["value"]["version"])
+
+    def test_01_real_payload_install_without_compiler(self):
+        for command in ("zig", "cc", "gcc", "clang", "make", "git", "curl", "tar"):
+            self.assertIsNone(shutil.which(command, path=self.env["PATH"]))
+        self.install()
+        self.assertTrue(self.launcher().is_file())
+        self.assertFalse(self.launcher().is_symlink())
+        self.assertEqual(self.launcher().stat().st_uid, os.getuid())
+        self.assertEqual(digest((self.tree() / "bin/zig-audit").read_bytes()),
+                         BASE["value"]["executable"]["sha256"])
+        self.aliases(self.tree() / "bin/zig-audit")
+        self.aliases(self.launcher())
+
+    def test_02_repeat_preserves_accepted_tree(self):
+        self.install()
+        before = snapshot(self.tree())
+        self.install()
+        self.assertEqual(snapshot(self.tree()), before)
+        self.aliases(self.launcher())
+
+    def test_03_default_is_fake_home_local(self):
+        args = self.install_args()[:-2]
+        self.run_command(args)
+        self.aliases(self.home / ".local/bin/zig-audit")
+        self.assertFalse(self.prefix.exists())
+
+    def test_04_manifest_digest_required(self):
+        self.run_command([INSTALL, "--archive", BASE["archive"], "--manifest", BASE["manifest"],
+                          "--prefix", self.prefix], success=False)
+        self.assertFalse(self.launcher().exists())
+
+    def test_05_manifest_digest_rejected(self):
+        args = self.install_args()
+        args[args.index("--manifest-sha256") + 1] = "0" * 64
+        self.run_command(args, success=False)
+        self.assertFalse(self.launcher().exists())
+
+    def test_06_archive_corruption_rejected(self):
+        artifact = self.altered()
+        with artifact["archive"].open("ab") as output:
+            output.write(b"adversarial-corruption")
+        self.reject(artifact)
+
+    def test_07_executable_hash_rejected(self):
+        self.reject(self.altered(mutate=lambda m: m["executable"].update(sha256="0" * 64)))
+
+    def test_08_wrong_target_rejected(self):
+        def wrong(value):
+            target = "aarch64-linux-musl" if value["target"] == "x86_64-linux-musl" else "x86_64-linux-musl"
+            value["target"] = target
+            value["release_id"] = "v%s-%s" % (value["version"], target)
+        self.reject(self.altered(mutate=wrong))
+
+    def test_09_payload_version_mismatch_rejected(self):
+        def wrong(value):
+            value["version"] = "99.0.0-adversarial"
+            value["release_id"] = "v%s-%s" % (value["version"], value["target"])
+            value["archive"]["name"] = "zig-audit-%s-%s.tar.xz" % (value["version"], value["target"])
+        self.reject(self.altered(mutate=wrong))
+
+    def test_10_duplicate_manifest_keys_rejected(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                def duplicate(value, encoded):
+                    if nested:
+                        old = json.dumps(value["archive"], sort_keys=True).encode()
+                        new = b'{"sha256":"' + value["archive"]["sha256"].encode() + b'",' + old[1:]
+                        return encoded.replace(old, new, 1)
+                    return b'{"package":"zig-audit",' + encoded[1:]
+                self.reject(self.altered(raw_manifest=duplicate))
+
+    def test_11_manifest_is_never_evaluated(self):
+        marker = self.root / "manifest-was-executed"
+        artifact = self.altered(mutate=lambda m: m.update(description="$(touch %s); `touch %s`" % (marker, marker)))
+        self.install(artifact)
+        self.assertFalse(marker.exists())
+        self.aliases(self.launcher())
+
+    def test_12_invalid_manifest_contract_rejected(self):
+        mutations = {
+            "schema": lambda m: m.update(schema="zig-audit.release/v999"),
+            "package": lambda m: m.update(package="other-package"),
+            "release-id": lambda m: m.update(release_id="vnot-the-release"),
+            "ruleset": lambda m: m.update(stable_ruleset=999),
+            "executable-path": lambda m: m["executable"].update(path="../zig-audit"),
+            "linkage": lambda m: m.update(linkage="dynamic"),
+            "cpu": lambda m: m.update(cpu="native"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                self.reject(self.altered(mutate=mutate))
+
+    def test_13_unsafe_archive_paths_rejected(self):
+        escaped = self.root / "escaped"
+        for name in ("../escaped", str(escaped), "bin/../escaped", "./bin/zig-audit", "bin//zig-audit", "bin\\zig-audit"):
+            with self.subTest(name=name):
+                members = [(name, BASE["payload"], tarfile.REGTYPE, "", 0o755),
+                           ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+                self.reject(self.altered(members=members))
+                self.assertFalse(escaped.exists())
+
+    def test_14_unsafe_archive_types_rejected(self):
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.DIRTYPE):
+            with self.subTest(kind=kind.decode()):
+                members = [("bin/zig-audit", b"", kind, "LICENSE", 0o755),
+                           ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+                self.reject(self.altered(members=members))
+
+    def test_15_archive_exact_members_required(self):
+        good = [("bin/zig-audit", BASE["payload"], tarfile.REGTYPE, "", 0o755),
+                ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+        for label, members in (("extra", good + [("README", b"extra", tarfile.REGTYPE, "", 0o644)]),
+                               ("duplicate", good + [good[0]]),
+                               ("missing-license", good[:1]), ("missing-executable", good[1:])):
+            with self.subTest(case=label):
+                self.reject(self.altered(members=members))
+
+    def test_16_non_executable_payload_rejected(self):
+        members = [("bin/zig-audit", BASE["payload"], tarfile.REGTYPE, "", 0o644),
+                   ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+        self.reject(self.altered(members=members))
+
+    def test_17_non_elf_payload_rejected(self):
+        self.reject(self.altered(payload=b"#!/bin/sh\nexit 0\n"))
+
+    def test_18_foreign_launcher_preserved(self):
+        self.launcher().parent.mkdir(parents=True)
+        self.launcher().write_text("#!/bin/sh\nprintf 'unrelated command\\n'\n")
+        self.launcher().chmod(0o755)
+        before = snapshot(self.launcher())
+        self.reject(BASE)
+        self.assertEqual(snapshot(self.launcher()), before)
+
+    def test_19_launcher_symlink_preserved(self):
+        self.launcher().parent.mkdir(parents=True)
+        foreign = self.root / "foreign"
+        foreign.write_text("keep these bytes")
+        self.launcher().symlink_to(foreign)
+        before = snapshot(foreign)
+        self.reject(BASE)
+        self.assertTrue(self.launcher().is_symlink())
+        self.assertEqual(snapshot(foreign), before)
+
+    def test_20_prefix_symlink_rejected(self):
+        target = self.root / "real-prefix"
+        target.mkdir()
+        self.prefix.symlink_to(target, target_is_directory=True)
+        before = snapshot(target)
+        self.reject(BASE)
+        self.assertEqual(snapshot(target), before)
+
+    def test_21_writable_prefix_rejected(self):
+        self.prefix.mkdir(mode=0o700)
+        self.prefix.chmod(0o777)
+        try:
+            self.reject(BASE)
+        finally:
+            self.prefix.chmod(0o700)
+
+    def test_22_existing_invalid_release_tree_rejected(self):
+        self.tree().mkdir(parents=True)
+        foreign = self.tree() / "unrelated"
+        foreign.write_text("preserve existing invalid release tree")
+        before = snapshot(self.tree())
+        self.reject(BASE)
+        self.assertEqual(snapshot(self.tree()), before)
+
+    def test_23_existing_release_symlink_rejected(self):
+        self.tree().parent.mkdir(parents=True)
+        foreign = self.root / "foreign-tree"
+        foreign.mkdir()
+        self.tree().symlink_to(foreign, target_is_directory=True)
+        before = snapshot(foreign)
+        self.reject(BASE)
+        self.assertEqual(snapshot(foreign), before)
+
+    def test_24_damaged_installed_payload_rejected(self):
+        self.install()
+        payload = self.tree() / "bin/zig-audit"
+        payload.chmod(0o755)
+        payload.write_bytes(payload.read_bytes() + b"corruption")
+        before = snapshot(self.tree())
+        self.reject(BASE)
+        self.assertEqual(snapshot(self.tree()), before)
+        self.rollback(BASE, success=False)
+
+    def test_25_rollback_cannot_traverse(self):
+        self.run_command([INSTALL, "--rollback", "../../elsewhere", "--prefix", self.prefix], success=False)
+        self.assertFalse(self.launcher().exists())
+
+    def test_26_upgrade_rollback_two_conforming_releases(self):
+        self.need_previous()
+        self.install(PREVIOUS)
+        self.aliases(self.launcher(), PREVIOUS)
+        prior = snapshot(self.tree(PREVIOUS))
+        self.install(BASE)
+        self.aliases(self.launcher(), BASE)
+        current = snapshot(self.tree(BASE))
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), prior)
+        self.rollback(PREVIOUS)
+        self.aliases(self.launcher(), PREVIOUS)
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), prior)
+        self.assertEqual(snapshot(self.tree(BASE)), current)
+        self.rollback(BASE)
+        self.aliases(self.launcher(), BASE)
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), prior)
+        self.assertEqual(snapshot(self.tree(BASE)), current)
+
+    def test_27_failed_candidate_preserves_active_release(self):
+        self.install()
+        before_launcher = snapshot(self.launcher())
+        before_tree = snapshot(self.tree())
+        bad = self.altered(mutate=lambda m: m["executable"].update(sha256="0" * 64))
+        self.reject(bad)
+        self.assertEqual(snapshot(self.launcher()), before_launcher)
+        self.assertEqual(snapshot(self.tree()), before_tree)
+        self.aliases(self.launcher())
+
+    def test_28_instrumented_preswitch_interruption_and_recovery(self):
+        self.need_previous()
+        self.install(PREVIOUS)
+        old_tree = snapshot(self.tree(PREVIOUS))
+        old_launcher = snapshot(self.launcher())
+        marker = self.root / "preswitch-probe-entered"
+        wrapper = """import pathlib, runpy, sys, time
+path = sys.argv[1]
+marker = pathlib.Path(sys.argv[2])
+sys.argv = [path] + sys.argv[3:]
+namespace = runpy.run_path(path, run_name='interrupted_installer_test')
+original = namespace['probe']
+def pause_before_probe(binary, manifest):
+    marker.write_text(str(binary))
+    while True:
+        time.sleep(0.1)
+namespace['main'].__globals__['probe'] = pause_before_probe
+raise SystemExit(namespace['main']())
+"""
+        command = [sys.executable, "-c", wrapper, str(INSTALL), str(marker)]
+        command.extend(str(x) for x in self.install_args()[1:])
+        process = subprocess.Popen(command, cwd=self.root, env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        stdout = stderr = ""
+        try:
+            deadline = time.monotonic() + 15
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), "installer did not reach the instrumented pre-switch probe")
+            self.assertEqual(snapshot(self.launcher()), old_launcher)
+            self.assertEqual(snapshot(self.tree(PREVIOUS)), old_tree)
+            self.aliases(self.launcher(), PREVIOUS)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+            (self.root / "interruption.json").write_text(json.dumps({
+                "kind": "instrumented pre-switch process termination; not a power-loss claim",
+                "returncode": process.returncode, "stdout": stdout, "stderr": stderr}, indent=2) + "\n")
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(snapshot(self.launcher()), old_launcher)
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), old_tree)
+        self.install(BASE)
+        self.aliases(self.launcher(), BASE)
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), old_tree)
+
+    def test_29_foreign_ownership(self):
+        self.skipTest("NOT RUN: creating a foreign-owned isolated fixture requires privilege; no sudo or live-prefix writes")
+
+    def test_30_altered_receipt_rejected(self):
+        self.install()
+        receipt = self.tree() / ".receipt.json"
+        value = read_manifest(receipt)
+        value["manifest_sha256"] = "0" * 64
+        receipt.write_text(json.dumps(value) + "\n")
+        before = snapshot(self.launcher())
+        self.rollback(BASE, success=False)
+        self.assertEqual(snapshot(self.launcher()), before)
+
+    def test_31_altered_retained_manifest_rejected(self):
+        self.install()
+        manifest = self.tree() / ".release.json"
+        with manifest.open("ab") as output:
+            output.write(b" ")
+        before = snapshot(self.launcher())
+        self.rollback(BASE, success=False)
+        self.assertEqual(snapshot(self.launcher()), before)
+
+    def test_32_altered_retained_license_rejected(self):
+        self.install()
+        license_path = self.tree() / "LICENSE"
+        with license_path.open("ab") as output:
+            output.write(b"corruption")
+        before = snapshot(self.launcher())
+        self.rollback(BASE, success=False)
+        self.assertEqual(snapshot(self.launcher()), before)
+
+    def test_33_bad_elf_headers_rejected(self):
+        def opposite_machine(data):
+            struct.pack_into("<H", data, 18, 183 if BASE["value"]["target"].startswith("x86_64-") else 62)
+        def dynamic_header(data):
+            offset = struct.unpack_from("<Q", data, 32)[0]
+            struct.pack_into("<I", data, offset, 2)
+        def interpreter_header(data):
+            offset = struct.unpack_from("<Q", data, 32)[0]
+            struct.pack_into("<I", data, offset, 3)
+        for label, mutation in (("wrong-machine", opposite_machine),
+                                ("dynamic-segment", dynamic_header),
+                                ("interpreter-segment", interpreter_header)):
+            with self.subTest(case=label):
+                data = bytearray(BASE["payload"])
+                mutation(data)
+                self.reject(self.altered(payload=bytes(data)))
+
+    def test_34_unsafe_archive_modes_rejected(self):
+        for mode in (0o777, 0o4755, 0o2755, 0o1755):
+            with self.subTest(mode=oct(mode)):
+                members = [("bin/zig-audit", BASE["payload"], tarfile.REGTYPE, "", mode),
+                           ("LICENSE", BASE["license"], tarfile.REGTYPE, "", 0o644)]
+                self.reject(self.altered(members=members))
+
+    def test_35_rollback_rechecks_retained_alias_identity(self):
+        self.need_previous()
+        self.install(PREVIOUS)
+        self.install(BASE)
+        active = snapshot(self.launcher())
+        current = snapshot(self.tree(BASE))
+        previous_tree = self.tree(PREVIOUS)
+        executable = previous_tree / "bin/zig-audit"
+        original_version = PREVIOUS["value"]["version"].encode()
+        changed_version = (b"8" if original_version[:1] == b"9" else b"9") + original_version[1:]
+        data = executable.read_bytes()
+        if original_version not in data:
+            self.skipTest("NOT RUN: cannot locate the previous ELF's literal identity for alias-recheck adversary")
+        changed = data.replace(original_version, changed_version)
+        executable.write_bytes(changed)
+        # Intentionally recompute local hashes so the alias gate, not a stale hash,
+        # must reject this adversarial retained tree. This is never a trusted release.
+        manifest_path = previous_tree / ".release.json"
+        manifest = read_manifest(manifest_path)
+        manifest["executable"].update(sha256=digest(changed), size=len(changed))
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+        receipt_path = previous_tree / ".receipt.json"
+        receipt = read_manifest(receipt_path)
+        receipt["manifest_sha256"] = digest(manifest_path.read_bytes())
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+        result = self.rollback(PREVIOUS, success=False)
+        self.assertIn("identity", result.stderr, "rollback must reach and reject the alias identity gate")
+        self.assertEqual(snapshot(self.launcher()), active)
+        self.assertEqual(snapshot(self.tree(BASE)), current)
+        self.aliases(self.launcher(), BASE)
+
+    def test_36_unsafe_input_manifest_rejected(self):
+        artifact = self.altered()
+        real = artifact["manifest"]
+        linked = real.parent / "linked.json"
+        linked.symlink_to(real)
+        self.reject(dict(artifact, manifest=linked))
+        real.chmod(0o666)
+        try:
+            self.reject(artifact)
+        finally:
+            real.chmod(0o644)
+
+    def test_37_installation_lock_serializes_writers(self):
+        import fcntl
+        self.install()
+        before_launcher = snapshot(self.launcher())
+        before_tree = snapshot(self.tree())
+        lock = self.prefix / "share/zig-audit/.install.lock"
+        with lock.open("r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.install(success=False)
+        self.assertEqual(snapshot(self.launcher()), before_launcher)
+        self.assertEqual(snapshot(self.tree()), before_tree)
+        self.install()
+        self.aliases(self.launcher())
+
+    def test_38_prefix_spaces_and_quotes(self):
+        prefix = self.root / "prefix with spaces and 'quote'"
+        self.install(prefix=prefix)
+        self.aliases(prefix / "bin/zig-audit")
+
+    def instrumented_release(self, good_pin):
+        log = self.root / "instrumented-downloads.jsonl"
+        marker = self.root / "payload-probe-entered"
+        version = BASE["value"]["version"]
+        target = BASE["value"]["target"]
+        origin = "https://github.com/LaurenceGuws/zig-audit/releases/download/v" + version + "/"
+        manifest_url = origin + "zig-audit-%s-%s.json" % (version, target)
+        archive_url = origin + BASE["value"]["archive"]["name"]
+        mapping = {manifest_url: str(BASE["manifest"]), archive_url: str(BASE["archive"])}
+        wrapper = """import json, pathlib, runpy, sys
+path, log_path, marker_path, mapping_text = sys.argv[1:5]
+mapping = json.loads(mapping_text)
+sys.argv = [path] + sys.argv[5:]
+namespace = runpy.run_path(path, run_name='instrumented_release_download_test')
+original_probe = namespace['probe']
+def local_download(url, destination, limit):
+    with pathlib.Path(log_path).open('a') as output:
+        output.write(json.dumps({'url': url, 'limit': limit}) + '\\n')
+    if url not in mapping:
+        raise ValueError('unexpected download URL; network is forbidden in this test')
+    data = pathlib.Path(mapping[url]).read_bytes()
+    if len(data) > limit:
+        raise ValueError('fixture exceeds download limit')
+    with destination.open('xb') as output:
+        output.write(data)
+def record_probe(binary, manifest):
+    pathlib.Path(marker_path).write_text(str(binary))
+    return original_probe(binary, manifest)
+namespace['main'].__globals__['download'] = local_download
+namespace['main'].__globals__['probe'] = record_probe
+raise SystemExit(namespace['main']())
+"""
+        pin = digest(BASE["manifest"].read_bytes()) if good_pin else "0" * 64
+        self.run_command([sys.executable, "-c", wrapper, INSTALL, log, marker,
+                          json.dumps(mapping), "--release", version, "--manifest-sha256",
+                          pin, "--prefix", self.prefix], success=good_pin)
+        downloads = [json.loads(line) for line in log.read_text().splitlines()]
+        expected = [{"url": manifest_url, "limit": 1024 * 1024}]
+        if good_pin:
+            expected.append({"url": archive_url, "limit": BASE["value"]["archive"]["size"]})
+        self.assertEqual(downloads, expected)
+        self.assertEqual(marker.exists(), good_pin)
+        return marker
+
+    def test_39_instrumented_explicit_release_download_selection(self):
+        self.instrumented_release(good_pin=True)
+        self.aliases(self.launcher())
+
+    def test_40_download_pin_failure_precedes_payload_execution(self):
+        self.instrumented_release(good_pin=False)
+        self.assertFalse(self.launcher().exists())
+
+    def test_41_live_published_release_download(self):
+        self.skipTest("NOT RUN: live publication/download is outside isolated acceptance; URL selection is instrumented")
+
+    def test_42_damaged_active_payload_can_rollback(self):
+        self.need_previous()
+        self.install(PREVIOUS)
+        intact = snapshot(self.tree(PREVIOUS))
+        self.install(BASE)
+        payload = self.tree(BASE) / "bin/zig-audit"
+        with payload.open("ab") as output:
+            output.write(b"simulated active payload damage")
+        damaged = snapshot(self.tree(BASE))
+        self.rollback(PREVIOUS)
+        self.aliases(self.launcher(), PREVIOUS)
+        self.assertEqual(snapshot(self.tree(PREVIOUS)), intact)
+        self.assertEqual(snapshot(self.tree(BASE)), damaged)
+
+    def probe_fixture(self, body):
+        """Unit-only script fixture: deliberately not a conforming release payload."""
+        executable = self.root / "unit-probe-fixture"
+        executable.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + body)
+        executable.chmod(0o755)
+        return executable
+
+    def test_43_unit_probe_output_flood_bound(self):
+        namespace = runpy.run_path(str(INSTALL), run_name="probe_unit_test")
+        executable = self.probe_fixture("import os\nwhile True:\n    os.write(1, b'x' * 8192)\n")
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "excessive output"):
+            namespace["probe"](executable, BASE["value"])
+        self.assertLess(time.monotonic() - started, 5, "output flood rejection was not prompt")
+
+    def test_44_unit_probe_accelerated_deadline(self):
+        namespace = runpy.run_path(str(INSTALL), run_name="probe_timeout_unit_test")
+        executable = self.probe_fixture("import time\ntime.sleep(60)\n")
+        probe = namespace["probe"]
+        # Advance the clock across the production 15-second deadline without a
+        # slow test. The child is real; this unit test also exercises kill/reap.
+        probe.__globals__["time"] = types.SimpleNamespace(monotonic=iter((0.0, 16.0)).__next__)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "timed out"):
+            probe(executable, BASE["value"])
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_45_unit_extension_header_rejected_before_parsing(self):
+        for kind in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME):
+            with self.subTest(kind=kind.decode()):
+                namespace = runpy.run_path(str(INSTALL), run_name="metadata_unit_test")
+                member = tarfile.TarInfo("metadata")
+                member.type, member.size = kind, 1024 * 1024 * 1024
+                header = member.tobuf(format=tarfile.USTAR_FORMAT)
+                archive = self.root / ("metadata-" + kind.decode() + ".xz")
+                archive.write_bytes(lzma.compress(header + bytes(1024), preset=0))
+                stage = namespace["stage_archive"]
+                def forbidden_parser(*args, **kwargs):
+                    raise AssertionError("extension metadata reached TarInfo parser")
+                stage.__globals__["tarfile"] = types.SimpleNamespace(
+                    TarInfo=types.SimpleNamespace(frombuf=forbidden_parser))
+                with self.assertRaisesRegex(ValueError, "regular USTAR"):
+                    stage(archive, self.root / ("tree-" + kind.decode()), b"{}", BASE["value"], "0" * 64)
+
+    def test_46_unit_decompression_output_ceiling(self):
+        namespace = runpy.run_path(str(INSTALL), run_name="decompression_unit_test")
+        stage = namespace["stage_archive"]
+        # Reduce only the tested ceiling: assert production passes a bounded
+        # max_length to the real decoder without allocating a 128 MiB fixture.
+        stage.__globals__["MAX_ARCHIVE"] = 4096
+        archive = self.root / "oversized-decompression.xz"
+        archive.write_bytes(lzma.compress(bytes(4096 + 8193), preset=0))
+        with self.assertRaisesRegex(ValueError, "decompression limit"):
+            stage(archive, self.root / "bounded-tree", b"{}", BASE["value"], "0" * 64)
+
+    def test_47_unit_xz_dictionary_memory_limit(self):
+        namespace = runpy.run_path(str(INSTALL), run_name="dictionary_unit_test")
+        compressed = bytearray(lzma.compress(b"small fixture", format=lzma.FORMAT_XZ,
+            filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 4096}]))
+        block_start = 12
+        block_size = (compressed[block_start] + 1) * 4
+        self.assertEqual(compressed[14:16], bytes((0x21, 1)), "unexpected fixture filter header")
+        # LZMA2 property 40 advertises a 4 GiB dictionary. Changing the stream
+        # property avoids allocating that dictionary in the fixture compressor.
+        compressed[16] = 40
+        crc = zlib.crc32(compressed[block_start:block_start + block_size - 4])
+        struct.pack_into("<I", compressed, block_start + block_size - 4, crc)
+        archive = self.root / "excessive-dictionary.xz"
+        archive.write_bytes(compressed)
+        with self.assertRaisesRegex(lzma.LZMAError, "Memory usage limit"):
+            namespace["stage_archive"](archive, self.root / "dictionary-tree", b"{}", BASE["value"], "0" * 64)
+
+    def test_48_foreign_owned_input_rejected_read_only(self):
+        foreign = Path(sys.executable).resolve()
+        info = foreign.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid == os.getuid():
+            self.skipTest("NOT RUN: no existing foreign-owned Python executable for read-only input check")
+        args = self.install_args()
+        args[args.index("--archive") + 1] = foreign
+        result = self.run_command(args, success=False)
+        self.assertIn("unowned", result.stderr)
+        self.assertFalse(self.launcher().exists())
+        self.assertEqual(foreign.stat().st_uid, info.st_uid)
+        self.assertEqual(foreign.stat().st_mtime_ns, info.st_mtime_ns)
+
+    def test_49_unit_download_accelerated_total_deadline(self):
+        namespace = runpy.run_path(str(INSTALL), run_name="download_deadline_unit_test")
+        download = namespace["download"]
+        original_handler = signal.getsignal(signal.SIGALRM)
+        real_setitimer = signal.setitimer
+        timers = []
+        def accelerated_timer(which, seconds):
+            timers.append(seconds)
+            return real_setitimer(which, min(seconds, 0.1))
+        class SlowResponse:
+            url = "https://github.com/fixture"
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, limit):
+                time.sleep(2)
+                return b""
+        download.__globals__["urllib"] = types.SimpleNamespace(request=types.SimpleNamespace(
+            Request=lambda *args, **kwargs: object(), urlopen=lambda *args, **kwargs: SlowResponse()))
+        download.__globals__["signal"] = types.SimpleNamespace(
+            signal=signal.signal, setitimer=accelerated_timer,
+            SIGALRM=signal.SIGALRM, ITIMER_REAL=signal.ITIMER_REAL)
+        with self.assertRaisesRegex(TimeoutError, "60 seconds"):
+            download("https://github.com/fixture", self.root / "partial-download", 1024)
+        self.assertEqual(timers, [60, 0])
+        self.assertEqual(signal.getsignal(signal.SIGALRM), original_handler)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+
+class RecordingResult(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.records = []
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self.records.append({"test": str(test), "result": "passed"})
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self.records.append({"test": str(test), "result": "not-run", "reason": reason})
+
+    def addFailure(self, test, error):
+        super().addFailure(test, error)
+        self.records.append({"test": str(test), "result": "failed", "detail": self._exc_info_to_string(error, test)})
+
+    def addError(self, test, error):
+        super().addError(test, error)
+        self.records.append({"test": str(test), "result": "error", "detail": self._exc_info_to_string(error, test)})
+
+    def addSubTest(self, test, subtest, error):
+        super().addSubTest(test, subtest, error)
+        if error:
+            self.records.append({"test": str(subtest), "result": "failed", "detail": self._exc_info_to_string(error, test)})
+
+
+def main():
+    global OPTIONS, RUN, BASE, PREVIOUS
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--work", required=True, type=Path, help="scratch parent; all test artifacts are retained here")
+    parser.add_argument("--archive", type=Path, help="real host-native static ELF release archive")
+    parser.add_argument("--manifest", type=Path, help="matching local release manifest")
+    parser.add_argument("--previous-archive", type=Path, help="second, distinct conforming release archive")
+    parser.add_argument("--previous-manifest", type=Path, help="matching previous-release manifest")
+    OPTIONS = parser.parse_args()
+    if bool(OPTIONS.archive) != bool(OPTIONS.manifest):
+        parser.error("--archive and --manifest must be supplied together")
+    if bool(OPTIONS.previous_archive) != bool(OPTIONS.previous_manifest):
+        parser.error("--previous-archive and --previous-manifest must be supplied together")
+    if OPTIONS.previous_archive and not OPTIONS.archive:
+        parser.error("--previous-* requires --archive and --manifest")
+    work = OPTIONS.work.expanduser().resolve()
+    if not work.is_dir():
+        parser.error("--work must be an existing scratch directory")
+    if work.stat().st_uid != os.getuid() or stat.S_IMODE(work.stat().st_mode) & 0o022:
+        parser.error("--work must be user-owned and not group/world writable")
+    RUN = Path(tempfile.mkdtemp(prefix="release-tests-", dir=work))
+    try:
+        if OPTIONS.archive:
+            BASE = load_artifact(OPTIONS.archive, OPTIONS.manifest)
+        if OPTIONS.previous_archive:
+            PREVIOUS = load_artifact(OPTIONS.previous_archive, OPTIONS.previous_manifest)
+    except (OSError, ValueError, KeyError, tarfile.TarError) as error:
+        parser.error("invalid test artifact: " + str(error))
+    print("Release acceptance evidence: " + str(RUN), flush=True)
+    print("Real release binaries only; mutated artifacts are adversarial fixtures, not releases.", flush=True)
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(Acceptance)
+    result = unittest.TextTestRunner(verbosity=2, resultclass=RecordingResult).run(suite)
+    summary = {"schema": "zig-audit.release-tests/v1", "run": str(RUN),
+               "archive": str(BASE["archive"]) if BASE else None,
+               "manifest_sha256": digest(BASE["manifest"].read_bytes()) if BASE else None,
+               "previous_archive": str(PREVIOUS["archive"]) if PREVIOUS else None,
+               "previous_manifest_sha256": digest(PREVIOUS["manifest"].read_bytes()) if PREVIOUS else None,
+               "tests_run": result.testsRun, "failures": len(result.failures),
+               "errors": len(result.errors), "not_run": len(result.skipped),
+               "successful": result.wasSuccessful(), "records": result.records,
+               "scope": "isolated prefixes; no compiler in installer PATH; no downloads or live activation",
+               "interruption_scope": "instrumented pre-switch process termination, not power-loss proof"}
+    (RUN / "results.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print("Results: " + str(RUN / "results.json"), flush=True)
+    if BASE is None:
+        print("NOT RUN: no release archive/manifest supplied; no acceptance claim", flush=True)
+        return 2
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

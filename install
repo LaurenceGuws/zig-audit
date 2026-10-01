@@ -1,19 +1,449 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Install one explicitly selected, hash-pinned release. Never build or use sudo."""
+import argparse
+import fcntl
+import hashlib
+import json
+import lzma
+import os
+from pathlib import Path
+import platform
+import re
+import selectors
+import shlex
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-cd "$root"
+SCHEMA = "zig-audit.release/v1"
+RECEIPT = "zig-audit.install/v1"
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z")
+SHA = re.compile(r"[0-9a-f]{64}\Z")
+COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+ORIGIN = "https://github.com/LaurenceGuws/zig-audit/releases/download"
+MAX_ARCHIVE = 128 * 1024 * 1024
+UID = os.getuid()
 
-zig=${ZIG:-$(command -v zig || true)}
-[[ -n "$zig" ]] || { echo 'zig-audit install: zig not found in PATH' >&2; exit 1; }
 
-expected=$(<.zigversion)
-actual=$("$zig" version)
-[[ "$actual" == "$expected" ]] || {
-  printf 'zig-audit install: Zig mismatch: expected %s, got %s\n' "$expected" "$actual" >&2
-  exit 1
-}
+def fail(message):
+    raise ValueError(message)
 
-"$zig" build test
-"$zig" build install -Doptimize=ReleaseSafe --prefix "$HOME/.local"
-"$HOME/.local/bin/zig-audit" version
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def regular(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != UID or info.st_mode & 0o022:
+        fail(f"refusing unowned, linked or writable file: {path}")
+    return info
+
+
+def read_owned(path, maximum=MAX_ARCHIVE):
+    info = regular(path)
+    if info.st_size > maximum:
+        fail(f"file too large: {path}")
+    return path.read_bytes()
+
+
+def decode(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                fail(f"duplicate metadata key: {key}")
+            result[key] = value
+        return result
+    return json.loads(data, object_pairs_hook=unique)
+
+
+def host_target():
+    if platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"):
+        fail("supported hosts are Linux x86_64 and AArch64")
+    return platform.machine() + "-linux-musl"
+
+
+def manifest_data(data):
+    value = decode(data)
+    if not isinstance(value, dict):
+        fail("manifest must be an object")
+    version = value.get("version")
+    target = value.get("target")
+    if not isinstance(version, str) or not VERSION.fullmatch(version):
+        fail("invalid release version")
+    if target != host_target():
+        fail(f"wrong target: expected {host_target()}, got {target}")
+    expected = {
+        "schema": SCHEMA, "package": "zig-audit", "cpu": "baseline",
+        "linkage": "static", "release_id": f"v{version}-{target}",
+    }
+    for key, required in expected.items():
+        if value.get(key) != required:
+            fail(f"invalid manifest {key}")
+    if type(value.get("stable_ruleset")) is not int or value["stable_ruleset"] < 3:
+        fail("invalid stable ruleset")
+    for key in ("archive", "executable", "source"):
+        if not isinstance(value.get(key), dict):
+            fail(f"missing {key} metadata")
+    archive = value["archive"]
+    executable = value["executable"]
+    if archive.get("name") != f"zig-audit-{version}-{target}.tar.xz":
+        fail("invalid archive name")
+    if executable.get("path") != "bin/zig-audit":
+        fail("invalid executable path")
+    for entry in (archive, executable):
+        if not isinstance(entry.get("sha256"), str) or not SHA.fullmatch(entry["sha256"]):
+            fail("invalid payload checksum")
+        if type(entry.get("size")) is not int or not 0 < entry["size"] <= MAX_ARCHIVE:
+            fail("invalid payload size")
+    for key in ("commit", "tree"):
+        if not isinstance(value["source"].get(key), str) or not COMMIT.fullmatch(value["source"][key]):
+            fail(f"invalid source {key}")
+    return value
+
+
+def directory(path, *, own=True, create=True):
+    if not path.exists() and not path.is_symlink() and create:
+        path.mkdir(mode=0o755)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+        fail(f"refusing linked or writable directory: {path}")
+    if info.st_uid not in ((UID,) if own else (0, UID)):
+        fail(f"refusing foreign-owned directory: {path}")
+
+
+def prefix_path(text):
+    path = Path(text).expanduser()
+    if not path.is_absolute() or ".." in path.parts or any(ord(c) < 32 for c in str(path)):
+        fail("prefix must be an absolute path without '..' or control characters")
+    # Check each existing ancestor without resolving away symlinks.
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        directory(current, own=current == path)
+    return path
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path, data, mode):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(path, mode)
+
+
+def static_elf(data, target):
+    if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+        fail("payload is not a little-endian ELF64 executable")
+    kind, machine = struct.unpack_from("<HH", data, 16)
+    expected_machine = 62 if target.startswith("x86_64-") else 183
+    if machine != expected_machine or kind not in (2, 3):
+        fail("ELF target does not match manifest")
+    offset = struct.unpack_from("<Q", data, 32)[0]
+    entry_size, count = struct.unpack_from("<HH", data, 54)
+    if count == 0 or entry_size < 56 or offset + entry_size * count > len(data):
+        fail("invalid ELF program headers")
+    for index in range(count):
+        if struct.unpack_from("<I", data, offset + entry_size * index)[0] in (2, 3):
+            fail("payload is not a static executable")
+
+
+def probe(binary, manifest):
+    expected = {"version": manifest["version"], "stable_ruleset": manifest["stable_ruleset"]}
+    for alias in ("version", "-v", "--version"):
+        process = subprocess.Popen([str(binary), alias], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                   cwd=binary.parent, start_new_session=True)
+        output = bytearray()
+        deadline = time.monotonic() + 15
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        fail("payload identity check timed out")
+                    for key, _ in selector.select(remaining):
+                        block = os.read(key.fd, 4097)
+                        if not block:
+                            selector.unregister(key.fileobj)
+                        elif key.data == "stderr" or len(output) + len(block) > 4096:
+                            fail("payload identity check produced excessive output or stderr")
+                        else:
+                            output.extend(block)
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if process.returncode or decode(output) != expected:
+                fail(f"payload identity check failed: {alias}")
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+
+def launcher_bytes(binary):
+    return ("#!/bin/sh\n# zig-audit release launcher v1\nexec " +
+            shlex.quote(str(binary)) + ' "$@"\n').encode()
+
+
+def tree_check(tree, expected_sha=None, run=True, payload=True):
+    directory(tree, create=False)
+    directory(tree / "bin", create=False)
+    if set(p.name for p in tree.iterdir()) != {"bin", "LICENSE", ".release.json", ".receipt.json"}:
+        fail("unexpected installed tree members")
+    if set(p.name for p in (tree / "bin").iterdir()) != {"zig-audit"}:
+        fail("unexpected installed bin members")
+    raw = read_owned(tree / ".release.json", 1024 * 1024)
+    receipt = decode(read_owned(tree / ".receipt.json", 16384))
+    if not isinstance(receipt, dict) or receipt.get("schema") != RECEIPT:
+        fail("invalid installation receipt")
+    pin = receipt.get("manifest_sha256")
+    if pin != digest(raw) or (expected_sha is not None and pin != expected_sha):
+        fail("installed manifest checksum mismatch")
+    manifest = manifest_data(raw)
+    if tree.name != manifest["release_id"]:
+        fail("installed directory identity mismatch")
+    if not payload:
+        return manifest
+    binary = tree / "bin/zig-audit"
+    data = read_owned(binary)
+    if not regular(binary).st_mode & stat.S_IXUSR:
+        fail("installed payload is not executable")
+    if digest(data) != manifest["executable"]["sha256"] or len(data) != manifest["executable"]["size"]:
+        fail("installed executable checksum mismatch")
+    if digest(read_owned(tree / "LICENSE")) != receipt.get("license_sha256"):
+        fail("installed license checksum mismatch")
+    static_elf(data, manifest["target"])
+    if run:
+        probe(binary, manifest)
+    return manifest
+
+
+def check_launcher(command, releases):
+    if not command.exists() and not command.is_symlink():
+        return
+    raw = read_owned(command, 16384)
+    # A marker alone is not ownership proof: require exact generated content and
+    # a receipt-bearing retained release under this prefix. Its payload may be
+    # damaged: an intact destination must remain available for explicit recovery.
+    for tree in releases.iterdir():
+        if tree.name.startswith("v") and raw == launcher_bytes(tree / "bin/zig-audit"):
+            tree_check(tree, run=False, payload=False)
+            return
+    fail(f"refusing foreign or invalid launcher: {command}")
+
+
+def download(url, destination, limit):
+    def expired(signum, frame):
+        raise TimeoutError("release download exceeded 60 seconds")
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 60)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "zig-audit-installer/1"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if not response.url.startswith("https://"):
+                fail("download redirected away from HTTPS")
+            with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+                size = 0
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > limit:
+                        fail("download exceeds expected size limit")
+                    output.write(block)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def stage_archive(archive, tree, raw, manifest, pin):
+    # Never use extractall: only two exact regular members may be materialized.
+    directory(tree)
+    directory(tree / "bin")
+    seen = set()
+    # Bound decompression before any tar metadata parser sees bytes. The fixed
+    # USTAR contract admits no PAX/GNU extensions, links, or hidden extra streams.
+    decoder = lzma.LZMADecompressor(memlimit=64 * 1024 * 1024)
+    raw_tar = decoder.decompress(archive.read_bytes(), max_length=MAX_ARCHIVE + 8193)
+    if len(raw_tar) > MAX_ARCHIVE + 8192 or not decoder.eof or decoder.unused_data:
+        fail("archive decompression limit or trailing stream")
+    offset = 0
+    while offset + 512 <= len(raw_tar) and raw_tar[offset:offset + 512] != bytes(512):
+        header = raw_tar[offset:offset + 512]
+        if header[257:265] != b"ustar\0" + b"00" or header[156:157] != b"0":
+            fail("only regular USTAR members are accepted")
+        member = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
+        if member.name not in ("bin/zig-audit", "LICENSE") or member.name in seen:
+            fail(f"unsafe or unexpected archive member: {member.name}")
+        if member.mode & 0o7022 or member.size <= 0 or member.size > MAX_ARCHIVE:
+            fail("unsafe archive mode or size")
+        if member.name == "bin/zig-audit" and not member.mode & 0o100:
+            fail("archive executable lacks execute permission")
+        seen.add(member.name)
+        offset += 512
+        data = raw_tar[offset:offset + member.size]
+        if len(data) != member.size:
+            fail("archive member size mismatch")
+        offset += (member.size + 511) // 512 * 512
+        if member.name == "bin/zig-audit":
+            item = manifest["executable"]
+            if len(data) != item["size"] or digest(data) != item["sha256"]:
+                fail("executable checksum mismatch")
+            static_elf(data, manifest["target"])
+        write(tree / member.name, data, 0o755 if member.name.startswith("bin/") else 0o644)
+    if len(raw_tar) - offset < 1024 or any(raw_tar[offset:]):
+        fail("invalid tar termination")
+    if seen != {"bin/zig-audit", "LICENSE"}:
+        fail("incomplete release archive")
+    write(tree / ".release.json", raw, 0o644)
+    receipt = {"schema": RECEIPT, "manifest_sha256": pin,
+               "license_sha256": digest((tree / "LICENSE").read_bytes())}
+    write(tree / ".receipt.json", (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o644)
+    probe(tree / "bin/zig-audit", manifest)
+    sync_directory(tree / "bin")
+    sync_directory(tree)
+
+
+def activate(command, tree):
+    data = launcher_bytes(tree / "bin/zig-audit")
+    if command.exists() and read_owned(command, 16384) == data:
+        return
+    fd, temporary = tempfile.mkstemp(prefix=".zig-audit-launcher.", dir=command.parent)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(0o755)
+        os.replace(temporary, command)
+        sync_directory(command.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    choice = parser.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--archive", type=Path)
+    choice.add_argument("--release")
+    choice.add_argument("--rollback", metavar="RELEASE-ID")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--prefix", default=str(Path.home() / ".local"))
+    args = parser.parse_args()
+    if os.geteuid() == 0 or os.geteuid() != UID:
+        fail("run as the ordinary owning user, without sudo")
+    target = host_target()
+    if args.rollback:
+        if args.manifest or args.manifest_sha256:
+            fail("rollback uses the retained verified receipt, not new metadata")
+        if not args.rollback.startswith("v") or not args.rollback.endswith("-" + target):
+            fail("invalid rollback release ID")
+        version = args.rollback[1:-(len(target) + 1)]
+        if not VERSION.fullmatch(version):
+            fail("invalid rollback version")
+    else:
+        if not args.manifest_sha256 or not SHA.fullmatch(args.manifest_sha256):
+            fail("supply the reviewed --manifest-sha256 trust pin")
+        if bool(args.archive) != bool(args.manifest):
+            fail("--archive and --manifest must be supplied together")
+        if args.release and not VERSION.fullmatch(args.release):
+            fail("select an explicit release version, never latest")
+    prefix = prefix_path(args.prefix)
+    for path in (prefix / "bin", prefix / "share", prefix / "share/zig-audit",
+                 prefix / "share/zig-audit/releases"):
+        directory(path)
+    state = prefix / "share/zig-audit"
+    releases = state / "releases"
+    command = prefix / "bin/zig-audit"
+    lock = state / ".install.lock"
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != UID or info.st_mode & 0o022:
+            fail("unsafe installation lock")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        check_launcher(command, releases)
+        if args.rollback:
+            tree = releases / args.rollback
+            manifest = tree_check(tree)
+        else:
+            with tempfile.TemporaryDirectory(prefix=".stage.", dir=releases) as temporary:
+                stage = Path(temporary)
+                if args.release:
+                    name = f"zig-audit-{args.release}-{target}"
+                    manifest_file = stage / "release.json"
+                    download(f"{ORIGIN}/v{args.release}/{name}.json", manifest_file, 1024 * 1024)
+                else:
+                    manifest_file = args.manifest
+                raw = read_owned(manifest_file, 1024 * 1024)
+                if digest(raw) != args.manifest_sha256:
+                    fail("manifest checksum mismatch")
+                manifest = manifest_data(raw)
+                if args.release and manifest["version"] != args.release:
+                    fail("selected release version mismatch")
+                if args.release:
+                    archive = stage / manifest["archive"]["name"]
+                    download(f"{ORIGIN}/v{args.release}/{archive.name}", archive, manifest["archive"]["size"])
+                else:
+                    archive = args.archive
+                data = read_owned(archive)
+                if digest(data) != manifest["archive"]["sha256"] or len(data) != manifest["archive"]["size"]:
+                    fail("archive checksum mismatch")
+                # Extract the verified bytes, not a mutable external pathname.
+                sealed = stage / "verified.tar.xz"
+                write(sealed, data, 0o600)
+                tree = releases / manifest["release_id"]
+                if tree.exists() or tree.is_symlink():
+                    tree_check(tree, args.manifest_sha256)
+                else:
+                    prepared = stage / manifest["release_id"]
+                    stage_archive(sealed, prepared, raw, manifest, args.manifest_sha256)
+                    os.rename(prepared, tree)
+                    sync_directory(releases)
+        # The single atomic launcher replacement is the commit point. An earlier
+        # interruption leaves the prior launcher untouched and all old trees intact.
+        check_launcher(command, releases)
+        activate(command, tree)
+        probe(command, manifest)
+        print(f"zig-audit: active {manifest['release_id']} at {command}")
+    finally:
+        os.close(fd)
+
+
+def interrupted(signum, frame):
+    raise InterruptedError(f"interrupted by signal {signum}")
+
+
+if __name__ == "__main__":
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupted)
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError, tarfile.TarError,
+            subprocess.SubprocessError, lzma.LZMAError) as error:
+        print(f"zig-audit install: {error}", file=sys.stderr)
+        sys.exit(1)

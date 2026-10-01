@@ -34,6 +34,11 @@ For exploration without enforcement:
 Machine-readable checker identity:
 
     zig-audit version
+    zig-audit -v
+    zig-audit --version
+
+All three standalone forms return the same JSON identity without project config.
+The check subcommand retains its verbose -v flag.
 
 ## Source acknowledgement
 
@@ -113,13 +118,79 @@ Schema 1 baseline files remain readable only as a migration bridge for existing
 consumers. New projects use schema 2. The legacy `accept` command is intentionally
 unavailable for schema 2.
 
-## Install
+## Rootless release installation
 
-The repository pins its Zig compiler in `.zigversion`:
+The installer consumes prebuilt releases. It never invokes Zig, builds source,
+uses sudo, or silently selects latest. Linux x86_64 and AArch64 payloads use
+baseline CPUs and static ELF executables. The installer requires Python 3
+(standard library only). Configured Git-source audits still require Git.
 
-    ./install
+First obtain the exact manifest SHA-256 from reviewed, trusted release metadata.
+A checksum downloaded beside an archive is integrity evidence, not independent
+publisher authentication. Do not run a downloaded installer without reviewing or
+otherwise authenticating it.
 
-The installer runs tests and installs a ReleaseSafe binary to `~/.local/bin`.
+    ./install --release 0.3.1 --manifest-sha256 REVIEWED_MANIFEST_SHA256
+
+This downloads the selected architecture's JSON manifest and tar.xz archive
+from this repository's exact GitHub release tag. It verifies the pinned manifest,
+archive size/hash, safe archive members, payload size/hash, static ELF target,
+and all three executable identity forms before activation. Downloaded JSON is
+never evaluated as code. Release publication is a separate operator step.
+
+For an offline archive, or an isolated pilot:
+
+    ./install --archive /absolute/release.tar.xz \
+      --manifest /absolute/release.json --manifest-sha256 REVIEWED_MANIFEST_SHA256 \
+      --prefix /absolute/isolated-prefix
+
+The default prefix is ~/.local. Trees live in
+PREFIX/share/zig-audit/releases/vVERSION-TARGET; PREFIX/bin/zig-audit is a
+regular, owned launcher switched with one atomic rename. A lock serializes
+installation. Every accepted tree retains the exact release metadata and an
+installation receipt. Repeating an identical install is idempotent; a changed
+artifact claiming the same release ID is rejected. Earlier trees are retained.
+
+Explicit rollback revalidates a retained conforming tree and switches the launcher:
+
+    ./install --rollback v0.3.1-pilot.1-x86_64-linux-musl --prefix /absolute/isolated-prefix
+
+The pilot version in this example is a local test artifact, not a published
+production release. Old 0.3.0 lacks the version aliases and is not a conforming
+rollback target. The installer refuses foreign launchers, existing source-built
+binaries, symlinked/writable installation paths, and invalid receipts instead of
+overwriting them. Migrating an existing live binary requires separate inspection
+and preservation of its exact bytes; this installer does not automate that step.
+Keep PREFIX/bin on PATH yourself. No shell configuration or system path is changed.
+
+Before the atomic launcher switch, interruption preserves the previous launcher.
+After the switch, the selected verified release is active. A forcibly killed
+process may leave an inert .stage.* directory; it does not select that directory
+or automatically delete it on a later run. This is process-interruption safety,
+not a claim of filesystem or hardware power-loss certification.
+
+## Building and preparing releases
+
+Development builds remain explicit and separate from deployment:
+
+    zig build test -j1 -Doptimize=ReleaseSafe
+    zig build check -j1 -Doptimize=ReleaseSafe
+    zig build -j1 -Doptimize=ReleaseSafe --prefix /absolute/workstream/build
+
+tools/release --help describes owner-local release preparation. Use a clean
+committed source tree, the pinned Fleet compiler profile, an available qualified
+workstation, and an output directory under the active workstream. It runs native
+format/test/build/self-audit checks, cross-builds the selected targets serially,
+verifies static ELF and packaged payload identity, and records source/tree,
+recipe, compiler source/patch/hash, auditor/config, commands and gate results.
+It does not create tags, upload, publish, install, or select a permanent builder.
+A cross build remains explicitly unexecuted until checked on matching hardware;
+do not promote it as target-native accepted. No reproducible-byte claim is made.
+
+tests/release --help describes isolated installer acceptance, including a pair
+of real conforming archives for upgrade/rollback. Keep its work directory under
+the active workstream. It reports fixture/instrumented cases distinctly from
+real executable acceptance.
 
 ## Design boundary
 

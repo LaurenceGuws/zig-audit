@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Prepare inert, clean-source zig-audit archives; never install or publish."""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl")
+RECIPE = Path(__file__).resolve()
+ROOT = RECIPE.parent.parent
+
+
+class ReleaseError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise ReleaseError(message)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def regular(path):
+    require(stat.S_ISREG(path.lstat().st_mode), f"not a regular file: {path}")
+
+
+def execute(argv, cwd, env=None):
+    result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    require(result.returncode == 0,
+            f"command failed ({result.returncode}): {argv}\n"
+            + result.stderr.decode("utf-8", errors="replace")[-16000:])
+    return result
+
+
+def git(root, *args):
+    return execute(["git", "-c", "core.hooksPath=/dev/null",
+                    "-c", "core.fsmonitor=false", "-C", root, *args], root).stdout
+
+
+def clean_source(root):
+    require(not git(root, "status", "--porcelain=v1", "--untracked-files=all",
+                    "--ignore-submodules=none").strip(),
+            "release source must be completely clean, including untracked files")
+    commit = git(root, "rev-parse", "--verify", "HEAD").decode().strip()
+    tree = git(root, "rev-parse", "HEAD^{tree}").decode().strip()
+    require(re.fullmatch(r"[0-9a-f]{40,64}", commit) is not None,
+            "invalid source commit identity")
+    # Submodules are outside this small owner's source/archive contract.
+    entries = git(root, "ls-tree", "-r", "-z", "HEAD").split(b"\0")
+    require(not any(entry.startswith(b"160000 ") for entry in entries),
+            "release source must not contain submodules")
+    return {"commit": commit, "tree": tree}
+
+
+def source_version(root):
+    main = (root / "src/main.zig").read_text()
+    zon = (root / "build.zig.zon").read_text()
+    main_versions = re.findall(r'^const version = "([^"]+)";$', main, re.M)
+    zon_versions = re.findall(r'^\s*\.version = "([^"]+)",$', zon, re.M)
+    rulesets = re.findall(r'^const stable_ruleset: u32 = ([0-9]+);$', main, re.M)
+    require(len(main_versions) == len(zon_versions) == len(rulesets) == 1,
+            "cannot uniquely identify source version and ruleset")
+    version = main_versions[0]
+    require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", version) is not None,
+            "unsupported release version syntax")
+    require(version == zon_versions[0], "src/main.zig and build.zig.zon versions differ")
+    require(rulesets[0] == "3", "this release contract requires stable_ruleset 3")
+    return version
+
+
+def compiler_identity(fleet, explicit_zig, arch, root):
+    pin = fleet / "toolchains/zig.env"
+    patch = fleet / "toolchains/zig/patches/0001-compiler-single-threaded.patch"
+    for path in (pin, patch):
+        regular(path)
+        require(path.read_bytes() == git(fleet, "show", "HEAD:" + str(path.relative_to(fleet))),
+                f"Fleet toolchain input differs from its committed version: {path}")
+    values = {}
+    for line in pin.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"(ZIG_[A-Z0-9_]+)=([A-Za-z0-9._+\-]+)", line)
+        require(match is not None, "invalid Fleet pin (plain inert KEY=value required)")
+        key, value = match.groups()
+        require(key not in values, f"duplicate Fleet pin: {key}")
+        values[key] = value
+    required = ["ZIG_VERSION", "ZIG_PROFILE", "ZIG_SOURCE_COMMIT",
+                "ZIG_SOURCE_PATCH_SHA256", f"ZIG_{arch.upper()}_BINARY_SHA256"]
+    require(all(key in values for key in required), "incomplete Fleet compiler pin")
+    require(re.fullmatch(r"[0-9a-f]{40}", values["ZIG_SOURCE_COMMIT"]) is not None,
+            "invalid Fleet compiler source commit")
+    for key in ("ZIG_SOURCE_PATCH_SHA256", f"ZIG_{arch.upper()}_BINARY_SHA256"):
+        require(re.fullmatch(r"[0-9a-f]{64}", values[key]) is not None, f"invalid {key}")
+    require(sha256(patch) == values["ZIG_SOURCE_PATCH_SHA256"], "Fleet source patch hash mismatch")
+    require((root / ".zigversion").read_text().strip() == values["ZIG_VERSION"],
+            "source .zigversion does not match Fleet pin")
+    zig = Path(explicit_zig).expanduser().resolve() if explicit_zig else (
+        Path.home() / ".local/share/fleet/zig" /
+        f"{values['ZIG_VERSION']}-{values['ZIG_PROFILE']}-{arch}" / "bin/zig")
+    regular(zig)
+    require(os.access(zig, os.X_OK), "compiler is not executable")
+    binary_hash = sha256(zig)
+    require(binary_hash == values[f"ZIG_{arch.upper()}_BINARY_SHA256"],
+            "compiler executable hash does not match Fleet pin (pass the binary, not a launcher)")
+    reported = execute([zig, "version"], root)
+    require(not reported.stderr and reported.stdout.decode().strip() == values["ZIG_VERSION"],
+            "compiler version does not match Fleet pin")
+    identity = {"version": values["ZIG_VERSION"], "profile": values["ZIG_PROFILE"],
+                "source_commit": values["ZIG_SOURCE_COMMIT"],
+                "patch_sha256": values["ZIG_SOURCE_PATCH_SHA256"], "binary_sha256": binary_hash}
+    evidence = {"commit": git(fleet, "rev-parse", "HEAD").decode().strip(),
+                "pin_sha256": sha256(pin)}
+    return zig, identity, evidence
+
+
+class Gates:
+    def __init__(self, work, env):
+        self.work, self.env = work, env
+        self.logs = work / "logs"
+        self.logs.mkdir()
+        self.sequence = 0
+
+    def run(self, name, argv, cwd, quiet_stderr=False):
+        self.sequence += 1
+        stem = f"{self.sequence:02d}-{name}"
+        args = [str(arg) for arg in argv]
+        print("+ " + " ".join(args), file=sys.stderr, flush=True)
+        result = subprocess.run(args, cwd=cwd, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout = self.logs / (stem + ".stdout")
+        stderr = self.logs / (stem + ".stderr")
+        stdout.write_bytes(result.stdout)
+        stderr.write_bytes(result.stderr)
+        receipt = {"status": "passed" if result.returncode == 0 else "failed",
+                   "command": args, "exit_code": result.returncode,
+                   "stdout_sha256": sha256(stdout), "stderr_sha256": sha256(stderr)}
+        (self.logs / (stem + ".json")).write_text(json.dumps(receipt, indent=2) + "\n")
+        require(result.returncode == 0,
+                f"gate {name} failed; retained evidence: {self.logs}\n"
+                + result.stderr.decode("utf-8", errors="replace")[-16000:])
+        require(not quiet_stderr or not result.stderr, f"gate {name} wrote unexpected stderr")
+        public = dict(receipt)
+        public["command"] = [arg.replace(str(self.work), "$WORK") for arg in args]
+        if Path(public["command"][0]).is_absolute():
+            public["command"][0] = "$ZIG"
+        return public, result.stdout
+
+    def versions(self, path, version, cwd):
+        outcomes = {}
+        for alias in ("version", "-v", "--version"):
+            receipt, output = self.run("version", [path, alias], cwd, quiet_stderr=True)
+            try:
+                actual = json.loads(output)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ReleaseError(f"invalid JSON from {path} {alias}") from error
+            require(actual == {"version": version, "stable_ruleset": 3},
+                    f"wrong version identity from {path} {alias}")
+            outcomes[alias] = receipt
+        return {"status": "passed", "aliases": outcomes}
+
+
+def verify_elf(path, target, gates, cwd):
+    regular(path)
+    with path.open("rb") as stream:
+        header = stream.read(64)
+    require(len(header) == 64 and header[:7] == b"\x7fELF\x02\x01\x01",
+            f"expected little-endian ELF64: {path}")
+    elf_type, machine = struct.unpack_from("<HH", header, 16)
+    expected_machine = {"x86_64-linux-musl": 62, "aarch64-linux-musl": 183}[target]
+    require(machine == expected_machine and elf_type in (2, 3),
+            f"wrong executable ELF architecture/type for {target}")
+    receipt, output = gates.run("elf", ["readelf", "--file-header", "--program-headers",
+                                       "--dynamic", "--wide", path], cwd, quiet_stderr=True)
+    text = output.decode()
+    require(re.search(r"^\s*LOAD\s", text, re.M) is not None, "ELF has no load segment")
+    require(re.search(r"^\s*(?:INTERP|DYNAMIC)\s", text, re.M) is None and "(NEEDED)" not in text,
+            "release executable has dynamic runtime linkage")
+    receipt.update({"class": "ELF64", "machine": machine, "linkage": "static"})
+    return receipt
+
+
+def archive_payload(candidate, license_path, archive, extracted, timestamp):
+    """Write exactly two regular members, then verify manually extracted bytes."""
+    sources = {"bin/zig-audit": (candidate, 0o755), "LICENSE": (license_path, 0o644)}
+    identities = {}
+    for name, (source, mode) in sources.items():
+        regular(source)
+        identities[name] = (sha256(source), source.stat().st_size, mode)
+    with tarfile.open(archive, "x:xz", format=tarfile.USTAR_FORMAT) as output:
+        for name, (source, mode) in sources.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode, info.mtime = identities[name][1], mode, timestamp
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            with source.open("rb") as stream:
+                output.addfile(info, stream)
+    extracted.mkdir()
+    with tarfile.open(archive, "r:xz") as source:
+        members = source.getmembers()
+        require(len(members) == 2 and {item.name for item in members} == set(sources),
+                "archive member set is not the exact payload contract")
+        for member in members:
+            digest, size, mode = identities[member.name]
+            require(member.type == tarfile.REGTYPE and member.mode == mode and member.size == size,
+                    f"unexpected archive member metadata: {member.name}")
+            destination = extracted / member.name
+            destination.parent.mkdir(exist_ok=True)
+            with source.extractfile(member) as stream, destination.open("xb") as output:
+                shutil.copyfileobj(stream, output)
+            destination.chmod(mode)
+            require(sha256(destination) == digest and destination.stat().st_size == size,
+                    f"extracted checksum mismatch: {member.name}")
+    require(sha256(candidate) == identities["bin/zig-audit"][0], "candidate changed during packaging")
+    return {"path": "bin/zig-audit", "sha256": identities["bin/zig-audit"][0],
+            "size": identities["bin/zig-audit"][1]}
+
+
+def capacity(output):
+    memory = None
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        match = re.search(r"^MemAvailable:\s+([0-9]+) kB$", meminfo.read_text(), re.M)
+        if match:
+            memory = int(match[1]) * 1024
+    return {"cpu_count": os.cpu_count(), "load_average": list(os.getloadavg()),
+            "available_memory_bytes": memory, "disk_free_bytes": shutil.disk_usage(output).free}
+
+
+def prepare(args):
+    require(platform.system() == "Linux" and platform.machine() in ("x86_64", "aarch64"),
+            "release builder must be native x86_64 or AArch64 Linux")
+    arch = platform.machine()
+    native = arch + "-linux-musl"
+    source = clean_source(ROOT)
+    version = source_version(ROOT)
+    regular(RECIPE)
+    require(RECIPE.read_bytes() == git(ROOT, "show", "HEAD:tools/release"),
+            "running recipe differs from the clean source commit")
+    recipe_hash = sha256(RECIPE)
+    fleet = Path(args.fleet).expanduser().resolve()
+    zig, compiler, fleet_evidence = compiler_identity(fleet, args.zig, arch, ROOT)
+    output = Path(args.output).expanduser().resolve()
+    require(output != ROOT and ROOT not in output.parents, "output must be outside the source repository")
+    output.mkdir(parents=True, exist_ok=True)
+    targets = list(TARGETS) if args.target == "both" else [args.target]
+    for target in targets:
+        base = f"zig-audit-{version}-{target}"
+        for suffix in (".tar.xz", ".json"):
+            require(not (output / (base + suffix)).exists(), f"refusing to overwrite {base + suffix}")
+    available = capacity(output)
+    print("Builder capacity: " + json.dumps(available), file=sys.stderr, flush=True)
+    require(available["disk_free_bytes"] >= 1024 ** 3, "less than 1 GiB free build space")
+    require(available["available_memory_bytes"] is None or
+            available["available_memory_bytes"] >= 1024 ** 3, "less than 1 GiB available build memory")
+    work = Path(tempfile.mkdtemp(prefix=".prepare-", dir=output))
+    print(f"Retaining build evidence in {work}", file=sys.stderr, flush=True)
+    env = os.environ.copy()
+    env.update({"LC_ALL": "C", "TZ": "UTC", "TMPDIR": str(work / "tmp"),
+                "ZIG_GLOBAL_CACHE_DIR": str(work / "global-cache"),
+                "ZIG_LOCAL_CACHE_DIR": str(work / "local-cache")})
+    for key in ("TMPDIR", "ZIG_GLOBAL_CACHE_DIR", "ZIG_LOCAL_CACHE_DIR"):
+        Path(env[key]).mkdir()
+    empty = work / "empty"
+    empty.mkdir()
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    (work / "builder-local.json").write_text(json.dumps({
+        "hostname": platform.node(), "system": platform.system(), "kernel": platform.release(),
+        "python": platform.python_version(), "capacity": available, "compiler_path": str(zig),
+        "work": str(work)}, indent=2) + "\n")
+    gates = Gates(work, env)
+    checkout = work / "source"
+    gates.run("source-clone", ["git", "-c", "core.hooksPath=/dev/null", "clone",
+                              "--no-hardlinks", "--no-checkout", "--", ROOT, checkout], work)
+    git(checkout, "checkout", "--detach", source["commit"])
+    require(clean_source(checkout) == source, "isolated source identity mismatch")
+    require(sha256(checkout / "tools/release") == recipe_hash, "isolated recipe identity mismatch")
+    timestamp = int(git(checkout, "show", "-s", "--format=%ct", source["commit"]).strip())
+
+    def build(target, step=None):
+        argv = [zig, "build"]
+        if step:
+            argv.append(step)
+        return argv + [f"-j{args.jobs}", "-Doptimize=ReleaseSafe", f"-Dtarget={target}",
+                       "-Dcpu=baseline", "--prefix", work / ("build-" + target),
+                       "--cache-dir", work / ("cache-" + target),
+                       "--global-cache-dir", work / "global-cache"]
+
+    native_gates = {"target": native}
+    native_gates["diff_check"], _ = gates.run("diff-check", ["git", "diff", "--check"], checkout)
+    native_gates["fmt"], _ = gates.run("fmt", [zig, "fmt", "--check", "build.zig", "src"], checkout)
+    for name, step in (("test", "test"), ("build", None), ("check", "check")):
+        native_gates[name], _ = gates.run("native-" + name, build(native, step), checkout)
+    auditor = work / ("build-" + native) / "bin/zig-audit"
+    native_gates["version_aliases"] = gates.versions(auditor, version, empty)
+    native_gates["self_audit"], _ = gates.run("self-audit", [auditor, "check", "-v"], checkout)
+    audit = {"version": version, "ruleset": 3, "binary_sha256": sha256(auditor),
+             "config_sha256": sha256(checkout / ".zig-audit.json"), "source_commit": source["commit"]}
+    staged = []
+    for target in targets:
+        target_gates = {"execution_kind": "native" if target == native else "cross"}
+        if target == native:
+            target_gates["build"] = native_gates["build"]
+        else:
+            target_gates["build"], _ = gates.run("cross-build", build(target), checkout)
+        candidate = work / ("build-" + target) / "bin/zig-audit"
+        target_gates["elf"] = verify_elf(candidate, target, gates, checkout)
+        base = f"zig-audit-{version}-{target}"
+        archive = work / (base + ".tar.xz")
+        extracted = work / ("extracted-" + target)
+        executable = archive_payload(candidate, checkout / "LICENSE", archive, extracted, timestamp)
+        target_gates["archive_payload"] = {"status": "passed", "members": ["bin/zig-audit", "LICENSE"],
+                                           "extracted_sha256": executable["sha256"]}
+        target_gates["version_aliases"] = (gates.versions(extracted / "bin/zig-audit", version, empty)
+            if target == native else {"status": "not-run", "reason": "requires target-native execution"})
+        manifest = {"schema": "zig-audit.release/v1", "package": "zig-audit", "version": version,
+                    "release_id": f"v{version}-{target}", "target": target, "cpu": "baseline",
+                    "linkage": "static", "stable_ruleset": 3,
+                    "archive": {"name": archive.name, "sha256": sha256(archive), "size": archive.stat().st_size},
+                    "executable": executable, "license_sha256": sha256(checkout / "LICENSE"),
+                    "source": source, "compiler": compiler,
+                    "recipe_sha256": recipe_hash, "audit": audit,
+                    "gates": {"native": native_gates, "target": target_gates},
+                    "runtime_dependencies": ["git (configured source: git audits)"],
+                    "builder": {"architecture": arch, "jobs": args.jobs,
+                                "optimization": "ReleaseSafe", "started_at": started,
+                                "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                "fleet": fleet_evidence,
+                                "reproducibility": "not-claimed"}}
+        manifest_path = work / (base + ".json")
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        staged.append((archive, manifest_path))
+    require(clean_source(ROOT) == source and clean_source(checkout) == source,
+            "source changed during release preparation")
+    require(sha256(zig) == compiler["binary_sha256"], "compiler changed during preparation")
+    # Exclusive hard-link promotion avoids overwriting existing immutable artifacts.
+    for archive, manifest in staged:
+        os.link(archive, output / archive.name)
+        os.link(manifest, output / manifest.name)
+        print(f"archive {sha256(archive)}  {output / archive.name}")
+        print(f"manifest {sha256(manifest)}  {output / manifest.name}")
+    print("Review and pin the manifest SHA-256 through trusted metadata before installation.")
+    print("Preparation is not publication or target-native cross acceptance.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, help="artifact and retained scratch directory (outside checkout)")
+    parser.add_argument("--fleet", required=True, help="local Fleet checkout containing the committed compiler pin")
+    parser.add_argument("--zig", help="actual pinned compiler executable; defaults to Fleet's installed tree")
+    parser.add_argument("--target", choices=(*TARGETS, "both"), default="both")
+    parser.add_argument("--jobs", type=int, choices=(1, 2), default=1, help="Zig jobs; targets always build sequentially")
+    args = parser.parse_args()
+    try:
+        prepare(args)
+    except (ReleaseError, OSError, ValueError, tarfile.TarError) as error:
+        print(f"zig-audit release: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
