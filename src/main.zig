@@ -1,4 +1,4 @@
-//! Tokenizes Zig source and emits a deterministic census of sensitive constructs.
+//! Implements the zig-audit CLI and tokenizer-based Zig source policy checker.
 
 const std = @import("std");
 
@@ -109,7 +109,13 @@ const Config = struct {
     };
 };
 
-const version = "0.3.0";
+const Project = struct {
+    config: Config,
+    config_path: []const u8,
+    root_path: []const u8,
+};
+
+const version = "0.4.0";
 const stable_ruleset: u32 = 3;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
@@ -120,17 +126,62 @@ const CheckOptions = struct {
     verbose: bool = false,
 };
 
+const AcceptOptions = struct {
+    config_path: []const u8 = default_config_path,
+};
+
+const HelpTopic = enum {
+    root,
+    check,
+    scan,
+    accept,
+    version,
+};
+
+const Command = union(enum) {
+    help: HelpTopic,
+    version,
+    scan: []const []const u8,
+    check: CheckOptions,
+    accept: AcceptOptions,
+};
+
+const CliFailure = struct {
+    message: []const u8,
+    argument: ?[]const u8 = null,
+};
+
+const ParseResult = union(enum) {
+    command: Command,
+    failure: CliFailure,
+};
+
 const CheckSummary = struct {
     acknowledged: usize = 0,
-    files: usize = 0,
+    files_checked: usize = 0,
 };
 
 /// Runs the zig-audit command-line checker.
 pub fn main(init: std.process.Init) void {
-    run(init) catch |failure| {
-        if (failure != error.CensusChanged and failure != error.AuditFailed)
-            emitFailure(init.io, failure);
-        std.process.exit(1);
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch |failure| {
+        emitFailure(init.io, failure);
+        std.process.exit(2);
+    };
+
+    const parsed = parseCommand(if (args.len > 1) args[1..] else &.{});
+    const command = switch (parsed) {
+        .command => |value| value,
+        .failure => |failure| {
+            emitCliFailure(init.io, failure);
+            std.process.exit(2);
+        },
+    };
+
+    dispatch(init, command) catch |failure| {
+        if (failure == error.AuditFailed or failure == error.CensusChanged)
+            std.process.exit(1);
+        if (failure != error.Reported) emitFailure(init.io, failure);
+        std.process.exit(2);
     };
 }
 
@@ -138,9 +189,6 @@ pub fn main(init: std.process.Init) void {
 // reason: The top-level CLI boundary must format any command failure before process exit.
 fn emitFailure(io: std.Io, failure: anyerror) void {
     const message = switch (failure) {
-        error.ExpectedCommand => "expected command: check, scan, or version",
-        error.ExpectedPath => "scan requires at least one Zig file or directory",
-        error.InvalidArguments => "invalid command arguments",
         error.InvalidConfig => "project config is malformed or contains unsupported fields",
         error.UnsupportedConfigSchema => "project config schema is newer or unsupported",
         error.CheckerRulesetTooOld => "checker stable ruleset is older than the project minimum; upgrade zig-audit",
@@ -153,61 +201,204 @@ fn emitFailure(io: std.Io, failure: anyerror) void {
     };
     var buffer: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
-    // zig-audit: acknowledge empty_catch
-    // reason: Fatal-path diagnostics are best-effort because the command failure already determines exit status.
-    stderr.interface.print("zig-audit: {s}\n", .{message}) catch {};
-    // zig-audit: acknowledge empty_catch
-    // reason: Flushing fatal-path diagnostics cannot replace the command failure that is already being reported.
-    stderr.interface.flush() catch {};
+    std.json.Stringify.value(.{
+        .schema = "zig-audit.error/v1",
+        .ok = false,
+        .@"error" = .{
+            .code = @errorName(failure),
+            .message = message,
+        },
+    }, .{}, &stderr.interface) catch return;
+    stderr.interface.writeByte('\n') catch return;
+    stderr.interface.flush() catch return;
 }
 
-fn run(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return error.ExpectedCommand;
-
-    if (std.mem.eql(u8, args[1], "version")) {
-        if (args.len != 2) return error.InvalidArguments;
-        return writeVersion(init.io);
-    }
-    if (std.mem.eql(u8, args[1], "scan")) {
-        if (args.len < 3) return error.ExpectedPath;
-        const findings = try scanPaths(init, args[2..]);
-        return writeFindings(init.io, findings);
-    }
-    if (std.mem.eql(u8, args[1], "check")) {
-        const options = try parseCheckOptions(args[2..]);
-        return checkProject(init, options);
-    }
-    if (std.mem.eql(u8, args[1], "accept")) {
-        if (args.len > 3) return error.InvalidArguments;
-        return acceptProject(init, if (args.len == 3) args[2] else default_config_path);
-    }
-
-    // Keep the original exploratory surface while the command shape is dogfooded.
-    const findings = try scanPaths(init, args[1..]);
-    return writeFindings(init.io, findings);
+fn emitCliFailure(io: std.Io, failure: CliFailure) void {
+    var buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    std.json.Stringify.value(.{
+        .schema = "zig-audit.error/v1",
+        .ok = false,
+        .@"error" = .{
+            .code = "Usage",
+            .message = failure.message,
+            .argument = failure.argument,
+            .hint = "run zig-audit --help",
+        },
+    }, .{ .emit_null_optional_fields = false }, &stderr.interface) catch return;
+    stderr.interface.writeByte('\n') catch return;
+    stderr.interface.flush() catch return;
 }
 
-fn parseCheckOptions(args: []const []const u8) !CheckOptions {
-    var result = CheckOptions{};
+fn emitPathFailure(io: std.Io, code: []const u8, message: []const u8, path: []const u8) void {
+    var buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    std.json.Stringify.value(.{
+        .schema = "zig-audit.error/v1",
+        .ok = false,
+        .@"error" = .{
+            .code = code,
+            .message = message,
+            .path = path,
+        },
+    }, .{}, &stderr.interface) catch return;
+    stderr.interface.writeByte('\n') catch return;
+    stderr.interface.flush() catch return;
+}
+
+fn parseCommand(args: []const []const u8) ParseResult {
+    if (args.len == 0) return .{ .command = .{ .help = .root } };
+
+    const first = args[0];
+    if (std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "--help")) {
+        if (args.len != 1) return usage("global help takes no arguments", args[1]);
+        return .{ .command = .{ .help = .root } };
+    }
+    if (std.mem.eql(u8, first, "help")) {
+        if (args.len == 1) return .{ .command = .{ .help = .root } };
+        if (args.len != 2) return usage("help accepts at most one command name", args[2]);
+        const topic = helpTopic(args[1]) orelse return usage("unknown help topic", args[1]);
+        return .{ .command = .{ .help = topic } };
+    }
+    if (std.mem.eql(u8, first, "version") or
+        std.mem.eql(u8, first, "--version") or
+        std.mem.eql(u8, first, "-v"))
+    {
+        if (args.len == 2 and (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")))
+            return .{ .command = .{ .help = .version } };
+        if (args.len != 1) return usage("version takes no arguments", args[1]);
+        return .{ .command = .version };
+    }
+    if (std.mem.eql(u8, first, "check")) return parseCheckCommand(args[1..]);
+    if (std.mem.eql(u8, first, "scan")) return parseScanCommand(args[1..]);
+    if (std.mem.eql(u8, first, "accept")) return parseAcceptCommand(args[1..]);
+    if (std.mem.startsWith(u8, first, "-")) return usage("unknown global option", first);
+    return usage("unknown command", first);
+}
+
+fn usage(message: []const u8, argument: []const u8) ParseResult {
+    return .{ .failure = .{ .message = message, .argument = argument } };
+}
+
+fn helpTopic(name: []const u8) ?HelpTopic {
+    if (std.mem.eql(u8, name, "check")) return .check;
+    if (std.mem.eql(u8, name, "scan")) return .scan;
+    if (std.mem.eql(u8, name, "accept")) return .accept;
+    if (std.mem.eql(u8, name, "version")) return .version;
+    return null;
+}
+
+fn parseCheckCommand(args: []const []const u8) ParseResult {
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")))
+        return .{ .command = .{ .help = .check } };
+
+    var options = CheckOptions{};
     var config_seen = false;
-    for (args) |arg| {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
         if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-            if (result.verbose) return error.InvalidArguments;
-            result.verbose = true;
+            if (options.verbose) return usage("verbose option specified more than once", arg);
+            options.verbose = true;
             continue;
         }
-        if (std.mem.startsWith(u8, arg, "-") or config_seen) return error.InvalidArguments;
-        result.config_path = arg;
-        config_seen = true;
+        if (std.mem.eql(u8, arg, "--config")) {
+            if (config_seen) return usage("config option specified more than once", arg);
+            if (index + 1 >= args.len) return usage("--config requires a path", arg);
+            index += 1;
+            options.config_path = args[index];
+            config_seen = true;
+            continue;
+        }
+        return usage("unknown check option or positional argument", arg);
     }
-    return result;
+    return .{ .command = .{ .check = options } };
+}
+
+fn parseAcceptCommand(args: []const []const u8) ParseResult {
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")))
+        return .{ .command = .{ .help = .accept } };
+
+    var options = AcceptOptions{};
+    var config_seen = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--config")) {
+            if (config_seen) return usage("config option specified more than once", arg);
+            if (index + 1 >= args.len) return usage("--config requires a path", arg);
+            index += 1;
+            options.config_path = args[index];
+            config_seen = true;
+            continue;
+        }
+        return usage("unknown accept option or positional argument", arg);
+    }
+    return .{ .command = .{ .accept = options } };
+}
+
+fn parseScanCommand(args: []const []const u8) ParseResult {
+    if (args.len == 1 and (std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")))
+        return .{ .command = .{ .help = .scan } };
+
+    if (args.len == 0) return usage("scan requires at least one Zig file or directory", "scan");
+    if (std.mem.eql(u8, args[0], "--")) {
+        if (args.len == 1) return usage("scan requires at least one Zig file or directory", "scan");
+        return .{ .command = .{ .scan = args[1..] } };
+    }
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--"))
+            return usage("place '--' immediately after scan when using dash-prefixed paths", arg);
+        if (std.mem.startsWith(u8, arg, "-"))
+            return usage("scan paths beginning with '-' require '--'", arg);
+    }
+    return .{ .command = .{ .scan = args } };
+}
+
+fn dispatch(init: std.process.Init, command: Command) !void {
+    switch (command) {
+        .help => |topic| try writeHelp(init.io, topic),
+        .version => try writeVersion(init.io),
+        .scan => |paths| {
+            const findings = try scanPaths(init, paths);
+            try writeFindings(init.io, findings);
+        },
+        .check => |options| checkProject(init, options) catch |failure| {
+            switch (failure) {
+                error.ConfigNotFound => emitPathFailure(init.io, "ConfigNotFound", "project config was not found", options.config_path),
+                error.InvalidConfig => emitPathFailure(init.io, "InvalidConfig", "project config is malformed or contains unsupported fields", options.config_path),
+                error.UnsupportedConfigSchema => emitPathFailure(init.io, "UnsupportedConfigSchema", "project config schema is newer or unsupported", options.config_path),
+                error.CheckerRulesetTooOld => emitPathFailure(init.io, "CheckerRulesetTooOld", "checker stable ruleset is older than the project minimum; upgrade zig-audit", options.config_path),
+                error.LegacyBaselineRequired => emitPathFailure(init.io, "LegacyBaselineRequired", "schema 1 requires a baseline path", options.config_path),
+                else => return failure,
+            }
+            return error.Reported;
+        },
+        .accept => |options| acceptProject(init, options.config_path) catch |failure| {
+            switch (failure) {
+                error.ConfigNotFound => emitPathFailure(init.io, "ConfigNotFound", "project config was not found", options.config_path),
+                error.InvalidConfig => emitPathFailure(init.io, "InvalidConfig", "project config is malformed or contains unsupported fields", options.config_path),
+                error.UnsupportedConfigSchema => emitPathFailure(init.io, "UnsupportedConfigSchema", "project config schema is newer or unsupported", options.config_path),
+                error.CheckerRulesetTooOld => emitPathFailure(init.io, "CheckerRulesetTooOld", "checker stable ruleset is older than the project minimum; upgrade zig-audit", options.config_path),
+                error.LegacyBaselineRequired => emitPathFailure(init.io, "LegacyBaselineRequired", "schema 1 requires a baseline path", options.config_path),
+                error.SourceAcknowledgementsRequired => emitPathFailure(init.io, "SourceAcknowledgementsRequired", "schema 2 uses source-local acknowledgements; accept is not available", options.config_path),
+                else => return failure,
+            }
+            return error.Reported;
+        },
+    }
 }
 
 fn scanPaths(init: std.process.Init, paths: []const []const u8) ![]Finding {
     var findings: std.ArrayList(Finding) = .empty;
     for (paths) |path| {
-        try scanPath(init.io, init.gpa, init.arena.allocator(), path, &findings);
+        scanPath(init.io, init.gpa, init.arena.allocator(), path, &findings) catch |failure| {
+            if (failure == error.FileNotFound) {
+                emitPathFailure(init.io, "PathNotFound", "scan path was not found", path);
+                return error.Reported;
+            }
+            return failure;
+        };
     }
     std.mem.sort(Finding, findings.items, {}, lessThan);
     return findings.toOwnedSlice(init.arena.allocator());
@@ -217,11 +408,14 @@ fn writeFindings(io: std.Io, findings: []const Finding) !void {
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
     for (findings) |finding| {
-        try stdout.interface.print("{s}|{s}|{s}\n", .{
-            finding.path,
-            finding.kind.name(),
-            finding.line,
-        });
+        try std.json.Stringify.value(.{
+            .schema = "zig-audit.scan/v1",
+            .path = finding.path,
+            .line = finding.line_number,
+            .kind = finding.kind.name(),
+            .source = finding.line,
+        }, .{}, &stdout.interface);
+        try stdout.interface.writeByte('\n');
     }
     try stdout.interface.flush();
 }
@@ -229,10 +423,89 @@ fn writeFindings(io: std.Io, findings: []const Finding) !void {
 fn writeVersion(io: std.Io) !void {
     var buffer: [256]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try stdout.interface.print(
-        "{{\"version\":\"{s}\",\"stable_ruleset\":{d}}}\n",
-        .{ version, stable_ruleset },
-    );
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.version/v1",
+        .version = version,
+        .stable_ruleset = stable_ruleset,
+    }, .{}, &stdout.interface);
+    try stdout.interface.writeByte('\n');
+    try stdout.interface.flush();
+}
+
+fn writeHelp(io: std.Io, topic: HelpTopic) !void {
+    const text = switch (topic) {
+        .root =>
+        \\zig-audit - tokenizer-based Zig source policy checker
+        \\
+        \\Usage:
+        \\  zig-audit check [--config PATH] [-v|--verbose]
+        \\  zig-audit scan [--] PATH...
+        \\  zig-audit accept [--config PATH]
+        \\  zig-audit version
+        \\  zig-audit help [COMMAND]
+        \\
+        \\Global options:
+        \\  -h, --help       Show help.
+        \\  -v, --version    Emit machine-readable version information.
+        \\
+        \\Exit status:
+        \\  0  Command completed successfully; check is clean.
+        \\  1  Source policy check failed.
+        \\  2  Usage, configuration, I/O, or tool failure.
+        \\
+        \\Run `zig-audit help COMMAND` for command-specific help.
+        \\
+        ,
+        .check =>
+        \\Usage: zig-audit check [--config PATH] [-v|--verbose]
+        \\
+        \\Audit the Git-owned Zig sources selected by project configuration.
+        \\The config file's parent directory is the project root. Git discovery,
+        \\source reads, include/exclude roots, and legacy baseline paths are all
+        \\resolved relative to that root, not the caller's working directory.
+        \\
+        \\Options:
+        \\  --config PATH    Project config. Default: .zig-audit.json
+        \\  -v, --verbose    Emit accepted acknowledgement records before summary.
+        \\  -h, --help       Show this help.
+        \\
+        \\Output is newline-delimited JSON on stdout. Tool errors are JSON on stderr.
+        \\
+        ,
+        .scan =>
+        \\Usage: zig-audit scan [--] PATH...
+        \\
+        \\Explore Zig files or directories without project-policy enforcement.
+        \\Paths are interpreted relative to the caller's working directory.
+        \\Use `--` immediately after `scan` for a path beginning with '-'.
+        \\
+        \\Output is one zig-audit.scan/v1 JSON record per finding on stdout.
+        \\
+        ,
+        .accept =>
+        \\Usage: zig-audit accept [--config PATH]
+        \\
+        \\Legacy schema-1 migration command. It rewrites the configured reviewed
+        \\baseline atomically. Schema 2 uses source-local acknowledgements and rejects
+        \\this command.
+        \\
+        \\Options:
+        \\  --config PATH    Project config. Default: .zig-audit.json
+        \\  -h, --help       Show this help.
+        \\
+        ,
+        .version =>
+        \\Usage: zig-audit version
+        \\       zig-audit --version
+        \\       zig-audit -v
+        \\
+        \\Emit zig-audit.version/v1 JSON with checker version and stable ruleset.
+        \\
+        ,
+    };
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try stdout.interface.writeAll(text);
     try stdout.interface.flush();
 }
 
@@ -255,12 +528,15 @@ fn acknowledgeableKind(kind: Kind) bool {
 }
 
 fn loadConfig(init: std.process.Init, path: []const u8) !Config {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
         init.io,
         path,
         init.arena.allocator(),
         .limited(64 * 1024),
-    );
+    ) catch |failure| switch (failure) {
+        error.FileNotFound => return error.ConfigNotFound,
+        else => return failure,
+    };
     var parsed = std.json.parseFromSlice(
         Config,
         init.arena.allocator(),
@@ -288,18 +564,55 @@ fn loadConfig(init: std.process.Init, path: []const u8) !Config {
     };
 }
 
+fn loadProject(init: std.process.Init, config_path: []const u8) !Project {
+    const root = std.fs.path.dirname(config_path) orelse ".";
+    return .{
+        .config = try loadConfig(init, config_path),
+        .config_path = try init.arena.allocator().dupe(u8, config_path),
+        .root_path = try init.arena.allocator().dupe(u8, root),
+    };
+}
+
 fn dupeStrings(allocator: Allocator, values: []const []const u8) ![]const []const u8 {
     const copy = try allocator.alloc([]const u8, values.len);
     for (values, 0..) |value, index| copy[index] = try allocator.dupe(u8, value);
     return copy;
 }
 
-fn projectPaths(init: std.process.Init, config: Config) ![]const []const u8 {
-    return switch (config.source) {
+fn projectPaths(init: std.process.Init, project: Project) ![]const []const u8 {
+    return switch (project.config.source) {
         .git => blk: {
+            const root_result = try std.process.run(init.gpa, init.io, .{
+                .argv = &.{
+                    "git",
+                    "-C",
+                    project.root_path,
+                    "rev-parse",
+                    "--show-prefix",
+                },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(64 * 1024),
+            });
+            defer init.gpa.free(root_result.stdout);
+            defer init.gpa.free(root_result.stderr);
+            const root_success = switch (root_result.term) {
+                .exited => |code| code == 0,
+                else => false,
+            };
+            if (!root_success) {
+                emitPathFailure(init.io, "SourceDiscoveryFailed", "project root is not inside a Git worktree", project.root_path);
+                return error.Reported;
+            }
+            if (std.mem.trim(u8, root_result.stdout, " \t\r\n").len != 0) {
+                emitPathFailure(init.io, "ProjectRootMismatch", "config parent must be the Git worktree root, not a nested directory", project.root_path);
+                return error.Reported;
+            }
+
             const result = try std.process.run(init.gpa, init.io, .{
                 .argv = &.{
                     "git",
+                    "-C",
+                    project.root_path,
                     "ls-files",
                     "--cached",
                     "--others",
@@ -317,12 +630,15 @@ fn projectPaths(init: std.process.Init, config: Config) ![]const []const u8 {
                 .exited => |code| code == 0,
                 else => false,
             };
-            if (!success) return error.SourceDiscoveryFailed;
+            if (!success) {
+                emitPathFailure(init.io, "SourceDiscoveryFailed", "Git source discovery failed for project root", project.root_path);
+                return error.Reported;
+            }
 
             var paths: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, result.stdout, 0);
             while (it.next()) |path| {
-                if (path.len == 0 or !sourceSelected(config, path)) continue;
+                if (path.len == 0 or !sourceSelected(project.config, path)) continue;
                 try paths.append(init.arena.allocator(), try init.arena.allocator().dupe(u8, path));
             }
             break :blk try paths.toOwnedSlice(init.arena.allocator());
@@ -330,8 +646,33 @@ fn projectPaths(init: std.process.Init, config: Config) ![]const []const u8 {
     };
 }
 
-fn projectFindings(init: std.process.Init, config: Config) ![]Finding {
-    return scanPaths(init, try projectPaths(init, config));
+fn projectPath(allocator: Allocator, project: Project, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    return std.fs.path.join(allocator, &.{ project.root_path, path });
+}
+
+fn projectFindings(init: std.process.Init, project: Project) ![]Finding {
+    const paths = try projectPaths(init, project);
+    var findings: std.ArrayList(Finding) = .empty;
+    for (paths) |path| {
+        const access_path = try projectPath(init.arena.allocator(), project, path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            access_path,
+            init.arena.allocator(),
+            .limited(16 * 1024 * 1024),
+        ) catch |failure| switch (failure) {
+            error.FileNotFound => {
+                emitPathFailure(init.io, "SourceNotFound", "configured source file disappeared during audit", access_path);
+                return error.Reported;
+            },
+            else => return failure,
+        };
+        const source = try init.arena.allocator().dupeSentinel(u8, bytes, 0);
+        try scanSource(init.arena.allocator(), path, source, &findings);
+    }
+    std.mem.sort(Finding, findings.items, {}, lessThan);
+    return findings.toOwnedSlice(init.arena.allocator());
 }
 
 fn sourceSelected(config: Config, path: []const u8) bool {
@@ -394,49 +735,69 @@ fn normalizeCensus(allocator: Allocator, bytes: []const u8) ![]u8 {
 }
 
 fn checkProject(init: std.process.Init, options: CheckOptions) !void {
-    const config = try loadConfig(init, options.config_path);
-    if (config.schema == legacy_config_schema) return checkLegacyProject(init, config);
-    return checkAcknowledgedProject(init, config, options.verbose);
+    const project = try loadProject(init, options.config_path);
+    if (project.config.schema == legacy_config_schema) return checkLegacyProject(init, project);
+    return checkAcknowledgedProject(init, project, options.verbose);
 }
 
-fn checkLegacyProject(init: std.process.Init, config: Config) !void {
-    const findings = try projectFindings(init, config);
+fn checkLegacyProject(init: std.process.Init, project: Project) !void {
+    const findings = try projectFindings(init, project);
     const actual = try legacyCensus(init, findings);
+    const baseline_path = try projectPath(init.arena.allocator(), project, project.config.baseline.?);
     const expected = std.Io.Dir.cwd().readFileAlloc(
         init.io,
-        config.baseline.?,
+        baseline_path,
         init.arena.allocator(),
         .limited(16 * 1024 * 1024),
-    ) catch return error.BaselineUnavailable;
+    ) catch |failure| switch (failure) {
+        error.FileNotFound => {
+            emitPathFailure(init.io, "BaselineUnavailable", "legacy reviewed baseline was not found", baseline_path);
+            return error.Reported;
+        },
+        else => return failure,
+    };
     const normalized_expected = try normalizeCensus(init.arena.allocator(), expected);
-    if (std.mem.eql(u8, normalized_expected, actual)) return;
+    if (std.mem.eql(u8, normalized_expected, actual)) {
+        try writeLegacyCheckSummary(init.io, true);
+        return;
+    }
 
     try writeCensusDiff(init.io, normalized_expected, actual);
+    try writeLegacyCheckSummary(init.io, false);
     return error.CensusChanged;
 }
 
 fn acceptProject(init: std.process.Init, config_path: []const u8) !void {
-    const config = try loadConfig(init, config_path);
-    if (config.schema != legacy_config_schema) return error.SourceAcknowledgementsRequired;
-    const findings = try projectFindings(init, config);
+    const project = try loadProject(init, config_path);
+    if (project.config.schema != legacy_config_schema) return error.SourceAcknowledgementsRequired;
+    const findings = try projectFindings(init, project);
     const actual = try legacyCensus(init, findings);
-    try writeAtomic(init.io, init.arena.allocator(), config.baseline.?, actual);
+    const baseline_path = try projectPath(init.arena.allocator(), project, project.config.baseline.?);
+    try writeAtomic(init.io, init.arena.allocator(), baseline_path, actual);
+    try writeAcceptResult(init.io, project);
 }
 
-fn checkAcknowledgedProject(init: std.process.Init, config: Config, verbose: bool) !void {
-    const paths = try projectPaths(init, config);
-    var stderr_buffer: [4096]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
+fn checkAcknowledgedProject(init: std.process.Init, project: Project, verbose: bool) !void {
+    const paths = try projectPaths(init, project);
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     var failed = false;
-    var summary = CheckSummary{};
+    var summary = CheckSummary{ .files_checked = paths.len };
 
     for (paths) |path| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        const access_path = try projectPath(init.arena.allocator(), project, path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
             init.io,
-            path,
+            access_path,
             init.arena.allocator(),
             .limited(16 * 1024 * 1024),
-        );
+        ) catch |failure| switch (failure) {
+            error.FileNotFound => {
+                emitPathFailure(init.io, "SourceNotFound", "configured source file disappeared during audit", access_path);
+                return error.Reported;
+            },
+            else => return failure,
+        };
         const source = try init.arena.allocator().dupeSentinel(u8, bytes, 0);
 
         var findings: std.ArrayList(Finding) = .empty;
@@ -447,95 +808,178 @@ fn checkAcknowledgedProject(init: std.process.Init, config: Config, verbose: boo
         @memset(matched, false);
         const resolutions = try init.arena.allocator().alloc(AcknowledgementResolution, acknowledgements.len);
         resolveAcknowledgements(findings.items, acknowledgements, matched, resolutions);
-        var file_acknowledged = false;
 
         for (acknowledgements, resolutions) |ack, resolution| {
             switch (resolution) {
                 .acknowledged => {
                     summary.acknowledged += 1;
-                    file_acknowledged = true;
-                    if (verbose) try stderr.interface.print(
-                        "ACK {s}:{d} {s}: {s}\n",
-                        .{ path, ack.target_line, ack.kind.?.name(), ack.reason },
+                    if (verbose) try writeCheckAcknowledgement(
+                        &stdout.interface,
+                        path,
+                        ack.target_line,
+                        ack.kind.?.name(),
+                        ack.reason,
                     );
                 },
                 .unknown_kind => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} acknowledgement: unknown rule {s}\n",
-                        .{ path, ack.marker_line, ack.kind_text },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "acknowledgement names an unknown rule",
+                        null,
                     );
                 },
                 .missing_reason => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} {s}: acknowledgement requires an adjacent // reason: line\n",
-                        .{ path, ack.marker_line, ack.kind_text },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "acknowledgement requires an adjacent // reason: line",
+                        null,
                     );
                 },
                 .empty_reason => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} {s}: acknowledgement reason is empty\n",
-                        .{ path, ack.marker_line, ack.kind_text },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "acknowledgement reason is empty",
+                        null,
                     );
                 },
                 .wrong_rule => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} {s}: acknowledgement names the wrong rule for source line {d}\n",
-                        .{ path, ack.marker_line, ack.kind_text, ack.target_line },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "acknowledgement names the wrong rule for its target source line",
+                        null,
                     );
                 },
                 .stale => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} {s}: stale acknowledgement has no matching finding on source line {d}\n",
-                        .{ path, ack.marker_line, ack.kind_text, ack.target_line },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "stale acknowledgement has no matching finding on its target source line",
+                        null,
                     );
                 },
                 .not_acknowledgeable => {
                     failed = true;
-                    try stderr.interface.print(
-                        "ERROR {s}:{d} {s}: this rule cannot be acknowledged; add /// documentation\n",
-                        .{ path, ack.marker_line, ack.kind_text },
+                    try writeCheckFinding(
+                        &stdout.interface,
+                        path,
+                        ack.marker_line,
+                        ack.kind_text,
+                        "this rule cannot be acknowledged; add /// documentation",
+                        null,
                     );
                 },
             }
         }
-        if (file_acknowledged) summary.files += 1;
 
         for (findings.items, matched) |finding, acknowledged| {
             if (!enforcedKind(finding.kind) or acknowledged) continue;
             failed = true;
             if (finding.kind == .pub_without_doc) {
-                try stderr.interface.print(
-                    "ERROR {s}:{d} pub_without_doc: public declaration requires /// documentation\n",
-                    .{ path, finding.line_number },
+                try writeCheckFinding(
+                    &stdout.interface,
+                    path,
+                    finding.line_number,
+                    finding.kind.name(),
+                    "public declaration requires /// documentation",
+                    finding.line,
                 );
             } else {
-                try stderr.interface.print(
-                    "ERROR {s}:{d} {s}: acknowledgement required\n",
-                    .{ path, finding.line_number, finding.kind.name() },
+                try writeCheckFinding(
+                    &stdout.interface,
+                    path,
+                    finding.line_number,
+                    finding.kind.name(),
+                    "acknowledgement required",
+                    finding.line,
                 );
             }
         }
     }
 
-    if (!failed) try writeCheckSummary(&stderr.interface, summary);
-    try stderr.interface.flush();
+    try writeCheckSummary(&stdout.interface, summary, !failed);
+    try stdout.interface.flush();
     if (failed) return error.AuditFailed;
 }
 
-fn writeCheckSummary(writer: *std.Io.Writer, summary: CheckSummary) !void {
-    try writer.print(
-        "zig-audit: PASS {d} acknowledged / {d} {s}\n",
-        .{
-            summary.acknowledged,
-            summary.files,
-            if (summary.files == 1) "file" else "files",
-        },
-    );
+fn writeCheckAcknowledgement(
+    writer: *std.Io.Writer,
+    path: []const u8,
+    line: usize,
+    rule: []const u8,
+    reason: []const u8,
+) !void {
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.check/v1",
+        .type = "acknowledgement",
+        .path = path,
+        .line = line,
+        .rule = rule,
+        .reason = reason,
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeCheckFinding(
+    writer: *std.Io.Writer,
+    path: []const u8,
+    line: usize,
+    rule: []const u8,
+    message: []const u8,
+    source: ?[]const u8,
+) !void {
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.check/v1",
+        .type = "finding",
+        .path = path,
+        .line = line,
+        .rule = rule,
+        .message = message,
+        .source = source,
+    }, .{ .emit_null_optional_fields = false }, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeCheckSummary(writer: *std.Io.Writer, summary: CheckSummary, passed: bool) !void {
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.check/v1",
+        .type = "summary",
+        .result = if (passed) "pass" else "fail",
+        .acknowledged = summary.acknowledged,
+        .files_checked = summary.files_checked,
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeAcceptResult(io: std.Io, project: Project) !void {
+    var buffer: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.accept/v1",
+        .ok = true,
+        .config = project.config_path,
+        .baseline = project.config.baseline.?,
+    }, .{}, &stdout.interface);
+    try stdout.interface.writeByte('\n');
+    try stdout.interface.flush();
 }
 
 fn parseAcknowledgements(allocator: Allocator, source: []const u8) ![]Acknowledgement {
@@ -650,8 +1094,7 @@ fn resolveAcknowledgements(
 
 fn writeCensusDiff(io: std.Io, expected: []const u8, actual: []const u8) !void {
     var buffer: [4096]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
-    try stderr.interface.writeAll("zig-audit: reviewed census changed\n");
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
 
     var old = std.mem.splitScalar(u8, expected, '\n');
     var new = std.mem.splitScalar(u8, actual, '\n');
@@ -659,12 +1102,12 @@ fn writeCensusDiff(io: std.Io, expected: []const u8, actual: []const u8) !void {
     var new_line = nextLine(&new);
     while (old_line != null or new_line != null) {
         if (old_line == null) {
-            try stderr.interface.print("+ {s}\n", .{new_line.?});
+            try writeLegacyChange(&stdout.interface, "added", new_line.?);
             new_line = nextLine(&new);
             continue;
         }
         if (new_line == null) {
-            try stderr.interface.print("- {s}\n", .{old_line.?});
+            try writeLegacyChange(&stdout.interface, "removed", old_line.?);
             old_line = nextLine(&old);
             continue;
         }
@@ -674,19 +1117,39 @@ fn writeCensusDiff(io: std.Io, expected: []const u8, actual: []const u8) !void {
                 new_line = nextLine(&new);
             },
             .lt => {
-                try stderr.interface.print("- {s}\n", .{old_line.?});
+                try writeLegacyChange(&stdout.interface, "removed", old_line.?);
                 old_line = nextLine(&old);
             },
             .gt => {
-                try stderr.interface.print("+ {s}\n", .{new_line.?});
+                try writeLegacyChange(&stdout.interface, "added", new_line.?);
                 new_line = nextLine(&new);
             },
         }
     }
-    try stderr.interface.writeAll(
-        "Review the source. If the census change is intentional, run: zig-audit accept\n",
-    );
-    try stderr.interface.flush();
+    try stdout.interface.flush();
+}
+
+fn writeLegacyChange(writer: *std.Io.Writer, change: []const u8, value: []const u8) !void {
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.check/v1",
+        .type = "legacy_census_change",
+        .change = change,
+        .value = value,
+    }, .{}, writer);
+    try writer.writeByte('\n');
+}
+
+fn writeLegacyCheckSummary(io: std.Io, passed: bool) !void {
+    var buffer: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(.{
+        .schema = "zig-audit.check/v1",
+        .type = "summary",
+        .result = if (passed) "pass" else "fail",
+        .legacy_schema = legacy_config_schema,
+    }, .{}, &stdout.interface);
+    try stdout.interface.writeByte('\n');
+    try stdout.interface.flush();
 }
 
 fn nextLine(lines: *std.mem.SplitIterator(u8, .scalar)) ?[]const u8 {
@@ -1318,49 +1781,72 @@ test "unknown acknowledgement rule is rejected" {
     try std.testing.expectEqual(AcknowledgementProblem.unknown_kind, acknowledgements[0].problem);
 }
 
-test "check options are quiet by default and accept verbose aliases" {
-    const quiet = try parseCheckOptions(&.{});
-    try std.testing.expectEqualStrings(default_config_path, quiet.config_path);
-    try std.testing.expect(!quiet.verbose);
+test "command grammar separates global version from check verbosity" {
+    const root = parseCommand(&.{});
+    switch (root) {
+        .command => |command| switch (command) {
+            .help => |topic| try std.testing.expectEqual(HelpTopic.root, topic),
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
 
-    const short = try parseCheckOptions(&.{"-v"});
-    try std.testing.expectEqualStrings(default_config_path, short.config_path);
-    try std.testing.expect(short.verbose);
+    for ([_][]const []const u8{
+        &.{"version"},
+        &.{"--version"},
+        &.{"-v"},
+    }) |argv| {
+        switch (parseCommand(argv)) {
+            .command => |command| switch (command) {
+                .version => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .failure => return error.TestUnexpectedResult,
+        }
+    }
 
-    const long = try parseCheckOptions(&.{ "--verbose", "project.json" });
-    try std.testing.expectEqualStrings("project.json", long.config_path);
-    try std.testing.expect(long.verbose);
+    switch (parseCommand(&.{ "check", "-v", "--config", "/repo/.zig-audit.json" })) {
+        .command => |command| switch (command) {
+            .check => |options| {
+                try std.testing.expect(options.verbose);
+                try std.testing.expectEqualStrings("/repo/.zig-audit.json", options.config_path);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
 
-    const reordered = try parseCheckOptions(&.{ "project.json", "-v" });
-    try std.testing.expectEqualStrings("project.json", reordered.config_path);
-    try std.testing.expect(reordered.verbose);
+    switch (parseCommand(&.{"chek"})) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("unknown command", failure.message);
+            try std.testing.expectEqualStrings("chek", failure.argument.?);
+        },
+        .command => return error.TestUnexpectedResult,
+    }
 
-    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{ "-v", "--verbose" }));
-    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{"--unknown"}));
-    try std.testing.expectError(error.InvalidArguments, parseCheckOptions(&.{ "one.json", "two.json" }));
+    switch (parseCommand(&.{ "scan", "--", "-generated.zig" })) {
+        .command => |command| switch (command) {
+            .scan => |paths| {
+                try std.testing.expectEqual(@as(usize, 1), paths.len);
+                try std.testing.expectEqualStrings("-generated.zig", paths[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
 }
 
-test "quiet check summary stays compact" {
+test "check summary is stable structured output" {
     var output = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 64);
     defer output.deinit();
 
-    try writeCheckSummary(&output.writer, .{ .acknowledged = 317, .files = 32 });
+    try writeCheckSummary(&output.writer, .{ .acknowledged = 317, .files_checked = 32 }, true);
     const text_value = try output.toOwnedSlice();
     defer std.testing.allocator.free(text_value);
 
     try std.testing.expectEqualStrings(
-        "zig-audit: PASS 317 acknowledged / 32 files\n",
+        "{\"schema\":\"zig-audit.check/v1\",\"type\":\"summary\",\"result\":\"pass\",\"acknowledged\":317,\"files_checked\":32}\n",
         text_value,
-    );
-
-    var singular = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 64);
-    defer singular.deinit();
-    try writeCheckSummary(&singular.writer, .{ .acknowledged = 4, .files = 1 });
-    const singular_text = try singular.toOwnedSlice();
-    defer std.testing.allocator.free(singular_text);
-    try std.testing.expectEqualStrings(
-        "zig-audit: PASS 4 acknowledged / 1 file\n",
-        singular_text,
     );
 }
 
