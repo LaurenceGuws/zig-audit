@@ -1,19 +1,388 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Install, inspect, or roll back a prebuilt zig-audit release."""
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-cd "$root"
+from __future__ import annotations
 
-zig=${ZIG:-$(command -v zig || true)}
-[[ -n "$zig" ]] || { echo 'zig-audit install: zig not found in PATH' >&2; exit 1; }
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
 
-expected=$(<.zigversion)
-actual=$("$zig" version)
-[[ "$actual" == "$expected" ]] || {
-  printf 'zig-audit install: Zig mismatch: expected %s, got %s\n' "$expected" "$actual" >&2
-  exit 1
-}
 
-"$zig" build test
-"$zig" build install -Doptimize=ReleaseSafe --prefix "$HOME/.local"
-"$HOME/.local/bin/zig-audit" version
+PACKAGE = "zig-audit"
+PACKAGE_SCHEMA = "zig-audit.package/v1"
+RECEIPT_SCHEMA = "release-pm.stage/v1"
+STATE_SCHEMA = "zig-audit.install/v1"
+
+
+class InstallError(Exception):
+    def __init__(self, code: str, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+def fail(code: str, message: str, **details: object) -> None:
+    raise InstallError(code, message, **details)
+
+
+def load_json(path: Path, *, limit: int = 64 * 1024) -> dict:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        fail("FileUnavailable", "required file could not be read", path=str(path), errno=exc.errno)
+    if len(data) > limit:
+        fail("FileTooLarge", "JSON input exceeds installer bound", path=str(path), limit=limit)
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("InvalidJson", "JSON input is malformed", path=str(path))
+    if not isinstance(value, dict):
+        fail("InvalidJson", "JSON input must be an object", path=str(path))
+    return value
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        fail("FileUnavailable", "artifact could not be hashed", path=str(path), errno=exc.errno)
+    return digest.hexdigest()
+
+
+def private_prefix(prefix: Path, *, create: bool) -> Path:
+    candidate = prefix.absolute()
+    if candidate == Path("/"):
+        fail("UnsafePrefix", "installation prefix cannot be filesystem root", prefix=str(candidate))
+    if candidate.is_symlink():
+        fail("UnsafePrefix", "installation prefix cannot be a symlink", prefix=str(candidate))
+    if create:
+        candidate.mkdir(mode=0o700, parents=True, exist_ok=True)
+    elif not candidate.exists():
+        fail("PrefixUnavailable", "installation prefix does not exist", prefix=str(candidate))
+    prefix = candidate.resolve()
+    if not prefix.is_dir():
+        fail("UnsafePrefix", "installation prefix must be a directory", prefix=str(prefix))
+    return prefix
+
+
+def validate_receipt(receipt: dict, artifact: Path) -> tuple[str, str]:
+    expected = {
+        "schema", "package", "version", "target", "release_id", "manifest_sha256",
+        "size", "sha256", "signature_namespace", "trusted_key_fingerprint",
+        "artifact", "manifest", "activation", "freshness",
+    }
+    if set(receipt) != expected:
+        fail("InvalidReceipt", "release-pm receipt has unexpected fields")
+    if receipt["schema"] != RECEIPT_SCHEMA or receipt["package"] != PACKAGE:
+        fail("InvalidReceipt", "release-pm receipt identity is not zig-audit")
+    version = receipt["version"]
+    target = receipt["target"]
+    if not isinstance(version, str) or not version or not isinstance(target, str) or not target:
+        fail("InvalidReceipt", "release-pm receipt version/target are invalid")
+    if receipt["release_id"] != f"v{version}-{target}":
+        fail("InvalidReceipt", "release-pm receipt release_id is inconsistent")
+    if receipt["artifact"] != "payload" or receipt["activation"] != "not-performed":
+        fail("InvalidReceipt", "release-pm receipt does not describe a staged unactivated payload")
+    try:
+        size = artifact.stat().st_size
+    except OSError as exc:
+        fail("FileUnavailable", "artifact metadata could not be read", path=str(artifact), errno=exc.errno)
+    if receipt["size"] != size or receipt["sha256"] != sha256(artifact):
+        fail("ArtifactMismatch", "artifact bytes do not match authenticated release-pm receipt")
+    return version, target
+
+
+def extract_package(artifact: Path, work: Path) -> tuple[dict, Path]:
+    try:
+        with tarfile.open(artifact, mode="r:xz") as archive:
+            members = archive.getmembers()
+            names = [member.name for member in members]
+            if names != ["package.json", "bin/zig-audit"]:
+                fail("InvalidPackage", "archive inventory must be exactly package.json and bin/zig-audit", members=names)
+            metadata_member, binary_member = members
+            if not metadata_member.isfile() or not binary_member.isfile():
+                fail("InvalidPackage", "archive members must be regular files")
+            if metadata_member.size > 16 * 1024 or binary_member.size > 64 * 1024 * 1024:
+                fail("InvalidPackage", "archive member exceeds installer bound")
+            metadata_stream = archive.extractfile(metadata_member)
+            binary_stream = archive.extractfile(binary_member)
+            if metadata_stream is None or binary_stream is None:
+                fail("InvalidPackage", "archive member could not be read")
+            metadata_bytes = metadata_stream.read()
+            try:
+                metadata = json.loads(metadata_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fail("InvalidPackage", "package.json is malformed")
+            if not isinstance(metadata, dict):
+                fail("InvalidPackage", "package.json must be an object")
+            binary_path = work / "zig-audit"
+            with binary_path.open("xb") as output:
+                shutil.copyfileobj(binary_stream, output, length=1024 * 1024)
+            binary_path.chmod(0o700)
+    except InstallError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        fail("InvalidPackage", "artifact is not a readable xz tar package", reason=str(exc))
+    return metadata, binary_path
+
+
+def validate_package(metadata: dict, binary: Path, version: str, target: str) -> int:
+    expected = {"schema", "package", "version", "target", "binary_sha256", "stable_ruleset"}
+    if set(metadata) != expected:
+        fail("InvalidPackage", "package.json has unexpected fields")
+    if metadata["schema"] != PACKAGE_SCHEMA or metadata["package"] != PACKAGE:
+        fail("InvalidPackage", "package.json identity is not zig-audit")
+    if metadata["version"] != version or metadata["target"] != target:
+        fail("InvalidPackage", "package.json does not match authenticated release selection")
+    if metadata["binary_sha256"] != sha256(binary):
+        fail("InvalidPackage", "packaged binary digest does not match package.json")
+    ruleset = metadata["stable_ruleset"]
+    if not isinstance(ruleset, int) or ruleset < 1:
+        fail("InvalidPackage", "stable_ruleset is invalid")
+    expected_identity = {
+        "schema": "zig-audit.version/v1",
+        "version": version,
+        "stable_ruleset": ruleset,
+    }
+    for alias in ("-v", "--version"):
+        try:
+            result = subprocess.run(
+                [binary, alias],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            fail("BinaryRejected", "packaged binary could not execute version probe", alias=alias)
+        if result.returncode != 0 or result.stderr != "":
+            fail("BinaryRejected", "packaged binary failed version probe", alias=alias, exit=result.returncode)
+        try:
+            identity = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            fail("BinaryRejected", "packaged binary version output is not JSON", alias=alias)
+        if identity != expected_identity:
+            fail("BinaryRejected", "packaged binary identity does not match package metadata", alias=alias)
+    return ruleset
+
+
+def replace_symlink(path: Path, target: str) -> None:
+    temp = path.with_name(f".{path.name}.new.{os.getpid()}")
+    try:
+        temp.unlink(missing_ok=True)
+        temp.symlink_to(target)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def read_link(path: Path) -> str | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    if not path.is_symlink():
+        fail("InvalidState", "activation pointer is not a symlink", path=str(path))
+    target = os.readlink(path)
+    if Path(target).is_absolute() or ".." in Path(target).parts:
+        fail("InvalidState", "activation pointer has unsafe target", path=str(path), target=target)
+    return target
+
+
+def write_json(path: Path, value: dict) -> None:
+    temp = path.with_name(f".{path.name}.new.{os.getpid()}")
+    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with temp.open("xb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    temp.chmod(0o600)
+    os.replace(temp, path)
+
+
+def ensure_entrypoint(prefix: Path) -> None:
+    bindir = prefix / "bin"
+    bindir.mkdir(mode=0o700, exist_ok=True)
+    entrypoint = bindir / PACKAGE
+    expected = "../current/bin/zig-audit"
+    if entrypoint.exists() or entrypoint.is_symlink():
+        if not entrypoint.is_symlink() or os.readlink(entrypoint) != expected:
+            fail("InvalidState", "stable entrypoint is occupied by foreign data", path=str(entrypoint))
+        return
+    entrypoint.symlink_to(expected)
+
+
+def install_release(artifact: Path, receipt_path: Path, prefix_arg: Path) -> dict:
+    prefix = private_prefix(prefix_arg, create=True)
+    artifact = artifact.resolve(strict=True)
+    receipt_path = receipt_path.resolve(strict=True)
+    receipt = load_json(receipt_path)
+    version, target = validate_receipt(receipt, artifact)
+    releases = prefix / "releases"
+    releases.mkdir(mode=0o700, exist_ok=True)
+    destination = releases / version
+    if destination.exists() or destination.is_symlink():
+        fail("ReleaseExists", "release tree already exists; installer never overwrites it", version=version)
+
+    work_parent = prefix / ".work"
+    work_parent.mkdir(mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="install-", dir=work_parent) as temp_name:
+        temp = Path(temp_name)
+        metadata, staged_binary = extract_package(artifact, temp)
+        ruleset = validate_package(metadata, staged_binary, version, target)
+        candidate = releases / f".{version}.new.{os.getpid()}"
+        candidate.mkdir(mode=0o700)
+        try:
+            (candidate / "bin").mkdir(mode=0o700)
+            shutil.copy2(staged_binary, candidate / "bin/zig-audit")
+            (candidate / "bin/zig-audit").chmod(0o700)
+            write_json(candidate / "release-pm-receipt.json", receipt)
+            write_json(candidate / "package.json", metadata)
+            os.replace(candidate, destination)
+        finally:
+            if candidate.exists():
+                shutil.rmtree(candidate)
+
+    ensure_entrypoint(prefix)
+    current = prefix / "current"
+    previous = prefix / "previous"
+    old_current = read_link(current)
+    new_target = f"releases/{version}"
+    if old_current == new_target:
+        fail("AlreadyActive", "release is already active", version=version)
+    if old_current is not None:
+        replace_symlink(previous, old_current)
+    replace_symlink(current, new_target)
+
+    activated = prefix / "bin/zig-audit"
+    identity = json.loads(subprocess.run(
+        [activated, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout)
+    if identity["version"] != version:
+        fail("ActivationFailed", "stable entrypoint does not resolve to installed release")
+
+    result = {
+        "schema": STATE_SCHEMA,
+        "operation": "install",
+        "package": PACKAGE,
+        "version": version,
+        "target": target,
+        "stable_ruleset": ruleset,
+        "prefix": str(prefix),
+        "active": new_target,
+        "previous": old_current,
+        "retention": "all release trees retained",
+    }
+    write_json(prefix / "last-operation.json", result)
+    return result
+
+
+def rollback(prefix_arg: Path) -> dict:
+    prefix = private_prefix(prefix_arg, create=False)
+    current = prefix / "current"
+    previous = prefix / "previous"
+    current_target = read_link(current)
+    previous_target = read_link(previous)
+    if current_target is None or previous_target is None:
+        fail("RollbackUnavailable", "both current and previous releases are required for rollback")
+    target_binary = prefix / previous_target / "bin/zig-audit"
+    if not target_binary.is_file() or target_binary.is_symlink():
+        fail("InvalidState", "previous release binary is unavailable", path=str(target_binary))
+    replace_symlink(current, previous_target)
+    replace_symlink(previous, current_target)
+    identity = json.loads(subprocess.run(
+        [prefix / "bin/zig-audit", "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout)
+    result = {
+        "schema": STATE_SCHEMA,
+        "operation": "rollback",
+        "package": PACKAGE,
+        "version": identity["version"],
+        "prefix": str(prefix),
+        "active": previous_target,
+        "previous": current_target,
+        "retention": "all release trees retained",
+    }
+    write_json(prefix / "last-operation.json", result)
+    return result
+
+
+def status(prefix_arg: Path) -> dict:
+    prefix = private_prefix(prefix_arg, create=False)
+    current = read_link(prefix / "current")
+    previous = read_link(prefix / "previous")
+    releases = []
+    release_root = prefix / "releases"
+    if release_root.is_dir():
+        releases = sorted(entry.name for entry in release_root.iterdir() if entry.is_dir() and not entry.is_symlink())
+    return {
+        "schema": STATE_SCHEMA,
+        "operation": "status",
+        "package": PACKAGE,
+        "prefix": str(prefix),
+        "active": current,
+        "previous": previous,
+        "releases": releases,
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="zig-audit-install")
+    mode = result.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--artifact", type=Path, help="authenticated prebuilt tar.xz from release-pm")
+    mode.add_argument("--rollback", action="store_true", help="activate the previous retained release")
+    mode.add_argument("--status", action="store_true", help="inspect isolated-prefix activation state")
+    result.add_argument("--receipt", type=Path, help="release-pm.stage/v1 receipt for --artifact")
+    result.add_argument("--prefix", type=Path, required=True, help="isolated installation prefix")
+    return result
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        if args.artifact is not None:
+            if args.receipt is None:
+                fail("Arguments", "--artifact requires --receipt")
+            value = install_release(args.artifact, args.receipt, args.prefix)
+        else:
+            if args.receipt is not None:
+                fail("Arguments", "--receipt is valid only with --artifact")
+            value = rollback(args.prefix) if args.rollback else status(args.prefix)
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    except InstallError as exc:
+        error = {"code": exc.code, "message": exc.message, **exc.details}
+        print(json.dumps({"schema": STATE_SCHEMA, "ok": False, "error": error}, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(json.dumps({
+            "schema": STATE_SCHEMA,
+            "ok": False,
+            "error": {"code": type(exc).__name__, "message": "installer operation failed"},
+        }, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

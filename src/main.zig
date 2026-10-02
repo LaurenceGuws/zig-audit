@@ -115,7 +115,7 @@ const Project = struct {
     root_path: []const u8,
 };
 
-const version = "0.4.0";
+const version = "0.4.1";
 const stable_ruleset: u32 = 3;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;

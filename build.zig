@@ -38,10 +38,15 @@ pub fn build(b: *std.Build) void {
     cli_contract.addArtifactArg(executable);
     cli_contract.setName("zig-audit CLI contract");
 
+    const install_contract = b.addSystemCommand(&.{"python3"});
+    install_contract.addFileArg(b.path("tests/install.py"));
+    install_contract.setName("zig-audit package/install lifecycle");
+
     const check = b.step("check", "Compile, test, and audit zig-audit");
     check.dependOn(&executable.step);
     check.dependOn(&run_tests.step);
     check.dependOn(&cli_contract.step);
+    check.dependOn(&install_contract.step);
 
     const audit = b.addRunArtifact(executable);
     audit.addArg("check");
@@ -51,4 +56,5 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zig-audit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&cli_contract.step);
+    test_step.dependOn(&install_contract.step);
 }

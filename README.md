@@ -156,11 +156,52 @@ unavailable for schema 2.
 
 ## Install
 
-The repository pins its Zig compiler in `.zigversion`:
+Release packages are prebuilt and owner-installed. `release-pm` authenticates and
+stages the archive; zig-audit owns archive validation, target-native version probes,
+activation, rollback, and retention inside an explicit prefix.
 
-    ./install
+Build a release binary with the repository's pinned Zig compiler:
 
-The installer runs tests and installs a ReleaseSafe binary to `~/.local/bin`.
+    zig build -Doptimize=ReleaseSafe
+
+Create a deterministic archive plus unsigned `zig-audit.release/v1` manifest:
+
+    ./tools/package \
+      --binary zig-out/bin/zig-audit \
+      --target x86_64-linux \
+      --output /private/new-zig-audit-package
+
+After release-pm has authenticated and staged that exact archive, hand its payload
+and `release-pm.stage/v1` receipt to the repository-owned installer:
+
+    ./install \
+      --artifact /private/cache/requests/REQUEST/verified/payload \
+      --receipt /private/cache/requests/REQUEST/verified/receipt.json \
+      --prefix /private/zig-audit-prefix
+
+The stable executable is then:
+
+    /private/zig-audit-prefix/bin/zig-audit
+
+Inspect or roll back the isolated prefix explicitly:
+
+    ./install --status --prefix /private/zig-audit-prefix
+    ./install --rollback --prefix /private/zig-audit-prefix
+
+The installer never overwrites a release tree. Updates retain the old release and
+atomically switch the `current` activation symlink. `previous` records the prior
+activation, so rollback swaps the two retained releases. Release pruning is not
+implemented.
+
+The package archive contains only `package.json` and `bin/zig-audit`. The installer
+requires the authenticated release-pm receipt to match archive size/hash, requires
+package identity/version/target to match the authenticated selection, checks the
+binary digest, and independently runs both `-v` and `--version` before activation.
+
+For source development, the repository still pins its Zig compiler in `.zigversion`:
+
+    zig build test
+    zig build check
 
 ## Design boundary
 

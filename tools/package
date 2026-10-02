@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Create a deterministic prebuilt zig-audit package and unsigned release manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def identity(binary: Path) -> dict:
+    outputs = []
+    for alias in ("-v", "--version"):
+        result = subprocess.run([binary, alias], text=True, capture_output=True, check=True, timeout=10)
+        if result.stderr:
+            raise SystemExit(f"version probe {alias} wrote stderr")
+        outputs.append(json.loads(result.stdout))
+    if outputs[0] != outputs[1]:
+        raise SystemExit("-v and --version identities differ")
+    value = outputs[0]
+    if set(value) != {"schema", "version", "stable_ruleset"} or value["schema"] != "zig-audit.version/v1":
+        raise SystemExit("binary does not expose zig-audit.version/v1")
+    return value
+
+
+def add_bytes(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = mode
+    info.mtime = 0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    archive.addfile(info, io.BytesIO(data))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    binary = args.binary.resolve(strict=True)
+    output = args.output.resolve()
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    ident = identity(binary)
+    version = ident["version"]
+    target = args.target
+    binary_bytes = binary.read_bytes()
+    package = {
+        "schema": "zig-audit.package/v1",
+        "package": "zig-audit",
+        "version": version,
+        "target": target,
+        "binary_sha256": sha256(binary_bytes),
+        "stable_ruleset": ident["stable_ruleset"],
+    }
+    package_bytes = (json.dumps(package, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    stem = f"zig-audit-{version}-{target}"
+    artifact = output / f"{stem}.tar.xz"
+    with tarfile.open(artifact, mode="w:xz", format=tarfile.PAX_FORMAT) as archive:
+        add_bytes(archive, "package.json", package_bytes, 0o600)
+        add_bytes(archive, "bin/zig-audit", binary_bytes, 0o700)
+    artifact_bytes = artifact.read_bytes()
+    manifest = {
+        "schema": "zig-audit.release/v1",
+        "package": "zig-audit",
+        "version": version,
+        "target": target,
+        "release_id": f"v{version}-{target}",
+        "archive": {
+            "name": artifact.name,
+            "size": len(artifact_bytes),
+            "sha256": sha256(artifact_bytes),
+        },
+    }
+    manifest_path = output / f"{stem}.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+    print(json.dumps({
+        "schema": "zig-audit.package-build/v1",
+        "artifact": str(artifact),
+        "manifest": str(manifest_path),
+        "version": version,
+        "target": target,
+        "size": len(artifact_bytes),
+        "sha256": manifest["archive"]["sha256"],
+    }, sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()
