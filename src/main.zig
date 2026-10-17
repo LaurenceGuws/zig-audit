@@ -115,7 +115,7 @@ const Project = struct {
     root_path: []const u8,
 };
 
-const version = "0.4.1";
+const version = "0.4.2";
 const stable_ruleset: u32 = 3;
 const current_config_schema: u32 = 2;
 const legacy_config_schema: u32 = 1;
@@ -603,10 +603,10 @@ fn projectPaths(init: std.process.Init, project: Project) ![]const []const u8 {
                 emitPathFailure(init.io, "SourceDiscoveryFailed", "project root is not inside a Git worktree", project.root_path);
                 return error.Reported;
             }
-            if (std.mem.trim(u8, root_result.stdout, " \t\r\n").len != 0) {
-                emitPathFailure(init.io, "ProjectRootMismatch", "config parent must be the Git worktree root, not a nested directory", project.root_path);
-                return error.Reported;
-            }
+            // Git lists paths relative to -C, including for nested package roots.
+            // Keep each config's scope anchored to its own directory; the worktree
+            // only supplies source discovery and exclusion semantics.
+            // Do not require the config parent to be the worktree root.
 
             const result = try std.process.run(init.gpa, init.io, .{
                 .argv = &.{

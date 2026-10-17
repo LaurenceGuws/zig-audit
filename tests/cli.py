@@ -195,20 +195,62 @@ def main() -> None:
         )
         assert invalid["path"] == str(malformed)
 
-        nongit_root = scratch / "nongit"
-        nongit_root.mkdir()
-        nongit_config = nongit_root / ".zig-audit.json"
-        nongit_config.write_text(json.dumps({
+        # A package inside a larger Git worktree owns only its own relative
+        # paths, even when invoked from a completely different working directory.
+        mono = scratch / "monorepo"
+        mono.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=mono, check=True)
+        child = mono / "packages" / "child"
+        nested = child / "nested"
+        nested.mkdir(parents=True)
+        (child / "src").mkdir()
+        (child / "src" / "main.zig").write_text(
+            "// zig-audit: acknowledge discard\n"
+            "// reason: Nested acknowledgement belongs to the child package.\n"
+            "_ = child_value;\n"
+        )
+        (child / "src" / "unchecked.zig").write_text("_ = unchecked;\n")
+        (nested / "nested.zig").write_text("_ = nested_value;\n")
+        (mono / "sibling.zig").write_text("_ = sibling_value;\n")
+        nested_config = child / ".zig-audit.json"
+        nested_config.write_text(json.dumps({
             "schema": 2,
             "source": "git",
             "minimum_ruleset": 3,
-            "include": ["src"],
+            "include": ["src", "nested"],
+            "exclude": ["nested"],
         }) + "\n")
-        discovery = one_error(
-            run(executable, ["check", "--config", str(nongit_config)], cwd=clean_root, expected=2),
-            "ProjectRootMismatch",
+        nested_check = run(
+            executable, ["check", "--config", str(nested_config)],
+            cwd=clean_root, expected=1,
         )
-        assert discovery["path"] == str(nongit_root)
+        docs = records(nested_check.stdout)
+        assert [doc["type"] for doc in docs] == ["finding", "summary"], docs
+        assert docs[0]["path"] == "src/unchecked.zig"
+        assert docs[0]["rule"] == "discard"
+        assert docs[-1]["files_checked"] == 2 and docs[-1]["acknowledged"] == 1
+        # This proves parent/sibling and excluded grandchild are never audited.
+        (child / "src" / "unchecked.zig").write_text("const accepted = 1;\n")
+        nested_ok = run(executable, ["check"], cwd=child, expected=0)
+        nested_docs = records(nested_ok.stdout)
+        assert nested_docs == [{
+            "schema": "zig-audit.check/v1", "type": "summary",
+            "result": "pass", "acknowledged": 1, "files_checked": 2,
+        }]
+
+        # An actual non-Git directory must still fail source discovery.
+        with tempfile.TemporaryDirectory(prefix="zig-audit-nongit-") as outside:
+            nongit_root = Path(outside)
+            nongit_config = nongit_root / ".zig-audit.json"
+            nongit_config.write_text(json.dumps({
+                "schema": 2, "source": "git", "minimum_ruleset": 3,
+                "include": ["src"],
+            }) + "\n")
+            discovery = one_error(
+                run(executable, ["check", "--config", str(nongit_config)], cwd=clean_root, expected=2),
+                "SourceDiscoveryFailed",
+            )
+            assert discovery["path"] == str(nongit_root)
 
         legacy_root = scratch / "legacy"
         legacy_config = project(legacy_root, "_ = value;\n", schema=1, baseline="reviewed.txt")

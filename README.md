@@ -72,9 +72,10 @@ explicit config such as:
 the config file's parent directory (`/work/project`) is the project root. Git source
 discovery, source reads, include/exclude roots and legacy baseline paths are all
 resolved against that root. The caller's current directory does not silently become
-the audited project. For `source: "git"`, that directory must itself be the Git
-worktree root; zig-audit refuses a nested directory that would otherwise inherit an
-enclosing repository.
+the audited project. For `source: "git"`, that root may be inside a Git worktree:
+Git returns paths relative to the config directory, so sibling packages and their
+source cannot enter the audit by accident. Nested package configs may exclude
+their own nested child-package roots; each child runs a separate audit gate.
 
 ## Source acknowledgement
 
@@ -133,6 +134,12 @@ remain observational. They are useful review signals, but are not inherently esc
 hatches and have not earned mandatory source annotations.
 
 ## Project config
+
+As of version 0.4.2, a package's config can live inside a larger Git
+worktree. Git scopes source paths relative to that package directory, so
+independent nested build roots can use their own configurations without
+requiring nested Git repositories. This changes discovery only, not the
+stable ruleset, acknowledgement grammar, or project policy.
 
 The current config schema is 2:
 
