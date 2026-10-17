@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, inspect, or roll back a prebuilt zig-audit release."""
+"""Install, inspect, or roll back a prebuilt, operator-pinned zig-audit artifact."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,8 +17,8 @@ import tempfile
 
 
 PACKAGE = "zig-audit"
-PACKAGE_SCHEMA = "zig-audit.package/v1"
-RECEIPT_SCHEMA = "release-pm.stage/v1"
+PACKAGE_SCHEMA = "zig-audit.package/v2"
+ARTIFACT_SCHEMA = "zig-audit.artifact/v1"
 STATE_SCHEMA = "zig-audit.install/v1"
 
 
@@ -76,31 +77,28 @@ def private_prefix(prefix: Path, *, create: bool) -> Path:
     return prefix
 
 
-def validate_receipt(receipt: dict, artifact: Path) -> tuple[str, str]:
-    expected = {
-        "schema", "package", "version", "target", "release_id", "manifest_sha256",
-        "size", "sha256", "signature_namespace", "trusted_key_fingerprint",
-        "artifact", "manifest", "activation", "freshness",
-    }
-    if set(receipt) != expected:
-        fail("InvalidReceipt", "release-pm receipt has unexpected fields")
-    if receipt["schema"] != RECEIPT_SCHEMA or receipt["package"] != PACKAGE:
-        fail("InvalidReceipt", "release-pm receipt identity is not zig-audit")
-    version = receipt["version"]
-    target = receipt["target"]
-    if not isinstance(version, str) or not version or not isinstance(target, str) or not target:
-        fail("InvalidReceipt", "release-pm receipt version/target are invalid")
-    if receipt["release_id"] != f"v{version}-{target}":
-        fail("InvalidReceipt", "release-pm receipt release_id is inconsistent")
-    if receipt["artifact"] != "payload" or receipt["activation"] != "not-performed":
-        fail("InvalidReceipt", "release-pm receipt does not describe a staged unactivated payload")
-    try:
-        size = artifact.stat().st_size
-    except OSError as exc:
-        fail("FileUnavailable", "artifact metadata could not be read", path=str(artifact), errno=exc.errno)
-    if receipt["size"] != size or receipt["sha256"] != sha256(artifact):
-        fail("ArtifactMismatch", "artifact bytes do not match authenticated release-pm receipt")
-    return version, target
+def native_target() -> str:
+    machine = os.uname().machine
+    if machine == "x86_64":
+        return "x86_64-linux"
+    if machine == "aarch64":
+        return "aarch64-linux"
+    fail("UnsupportedTarget", "unsupported machine architecture", architecture=machine)
+
+
+def verify_selected_artifact(path: Path, revision: str, expected_sha: str, expected_size: int) -> Path:
+    # The operator's selected pins are input, never a publisher signature.
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        fail("InvalidSelection", "selected source revision must be a full Git SHA")
+    if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        fail("InvalidSelection", "selected artifact SHA-256 is invalid")
+    if not isinstance(expected_size, int) or expected_size < 1 or expected_size > 128 * 1024 * 1024:
+        fail("InvalidSelection", "selected artifact size is invalid")
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        fail("FileUnavailable", "artifact must be an absolute regular non-symlink file", path=str(path))
+    if path.stat().st_size != expected_size or sha256(path) != expected_sha:
+        fail("ArtifactMismatch", "artifact differs from the independently selected SHA-256 and size")
+    return path
 
 
 def extract_package(artifact: Path, work: Path) -> tuple[dict, Path]:
@@ -137,18 +135,24 @@ def extract_package(artifact: Path, work: Path) -> tuple[dict, Path]:
     return metadata, binary_path
 
 
-def validate_package(metadata: dict, binary: Path, version: str, target: str) -> int:
-    expected = {"schema", "package", "version", "target", "binary_sha256", "stable_ruleset"}
+def validate_package(metadata: dict, binary: Path, selected_revision: str) -> tuple[str, str, int]:
+    expected = {"schema", "package", "version", "target", "revision", "binary_sha256", "stable_ruleset"}
     if set(metadata) != expected:
         fail("InvalidPackage", "package.json has unexpected fields")
     if metadata["schema"] != PACKAGE_SCHEMA or metadata["package"] != PACKAGE:
         fail("InvalidPackage", "package.json identity is not zig-audit")
-    if metadata["version"] != version or metadata["target"] != target:
-        fail("InvalidPackage", "package.json does not match authenticated release selection")
+    version = metadata["version"]
+    target = metadata["target"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        fail("InvalidPackage", "package version is invalid")
+    if target != native_target():
+        fail("WrongTarget", "selected artifact target does not match this machine", target=target, native=native_target())
+    if metadata["revision"] != selected_revision:
+        fail("RevisionMismatch", "package revision differs from the independently selected Git SHA")
     if metadata["binary_sha256"] != sha256(binary):
         fail("InvalidPackage", "packaged binary digest does not match package.json")
     ruleset = metadata["stable_ruleset"]
-    if not isinstance(ruleset, int) or ruleset < 1:
+    if not isinstance(ruleset, int) or isinstance(ruleset, bool) or ruleset < 1:
         fail("InvalidPackage", "stable_ruleset is invalid")
     expected_identity = {
         "schema": "zig-audit.version/v1",
@@ -176,7 +180,7 @@ def validate_package(metadata: dict, binary: Path, version: str, target: str) ->
             fail("BinaryRejected", "packaged binary version output is not JSON", alias=alias)
         if identity != expected_identity:
             fail("BinaryRejected", "packaged binary identity does not match package metadata", alias=alias)
-    return ruleset
+    return version, target, ruleset
 
 
 def replace_symlink(path: Path, target: str) -> None:
@@ -223,31 +227,40 @@ def ensure_entrypoint(prefix: Path) -> None:
     entrypoint.symlink_to(expected)
 
 
-def install_release(artifact: Path, receipt_path: Path, prefix_arg: Path) -> dict:
+def install_release(
+    artifact_arg: Path, selected_revision: str, selected_sha: str,
+    selected_size: int, prefix_arg: Path,
+) -> dict:
+    artifact = verify_selected_artifact(artifact_arg, selected_revision, selected_sha, selected_size)
     prefix = private_prefix(prefix_arg, create=True)
-    artifact = artifact.resolve(strict=True)
-    receipt_path = receipt_path.resolve(strict=True)
-    receipt = load_json(receipt_path)
-    version, target = validate_receipt(receipt, artifact)
     releases = prefix / "releases"
     releases.mkdir(mode=0o700, exist_ok=True)
-    destination = releases / version
-    if destination.exists() or destination.is_symlink():
-        fail("ReleaseExists", "release tree already exists; installer never overwrites it", version=version)
 
     work_parent = prefix / ".work"
     work_parent.mkdir(mode=0o700, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="install-", dir=work_parent) as temp_name:
         temp = Path(temp_name)
         metadata, staged_binary = extract_package(artifact, temp)
-        ruleset = validate_package(metadata, staged_binary, version, target)
+        version, target, ruleset = validate_package(metadata, staged_binary, selected_revision)
+        destination = releases / version
+        if destination.exists() or destination.is_symlink():
+            fail("ReleaseExists", "release tree already exists; installer never overwrites it", version=version)
         candidate = releases / f".{version}.new.{os.getpid()}"
         candidate.mkdir(mode=0o700)
         try:
             (candidate / "bin").mkdir(mode=0o700)
             shutil.copy2(staged_binary, candidate / "bin/zig-audit")
             (candidate / "bin/zig-audit").chmod(0o700)
-            write_json(candidate / "release-pm-receipt.json", receipt)
+            write_json(candidate / "artifact.json", {
+                "schema": ARTIFACT_SCHEMA,
+                "package": PACKAGE,
+                "version": version,
+                "target": target,
+                "revision": selected_revision,
+                "sha256": selected_sha,
+                "size": selected_size,
+                "trust": "operator-pinned-source-build-not-signed",
+            })
             write_json(candidate / "package.json", metadata)
             os.replace(candidate, destination)
         finally:
@@ -283,6 +296,7 @@ def install_release(artifact: Path, receipt_path: Path, prefix_arg: Path) -> dic
         "package": PACKAGE,
         "version": version,
         "target": target,
+        "revision": selected_revision,
         "stable_ruleset": ruleset,
         "prefix": str(prefix),
         "active": new_target,
@@ -348,12 +362,14 @@ def status(prefix_arg: Path) -> dict:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="zig-audit-install")
+    result = argparse.ArgumentParser(prog="zig-audit-artifact-install")
     mode = result.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--artifact", type=Path, help="authenticated prebuilt tar.xz from release-pm")
+    mode.add_argument("--promote-artifact", type=Path, help="prebuilt archive from a selected source revision")
     mode.add_argument("--rollback", action="store_true", help="activate the previous retained release")
     mode.add_argument("--status", action="store_true", help="inspect isolated-prefix activation state")
-    result.add_argument("--receipt", type=Path, help="release-pm.stage/v1 receipt for --artifact")
+    result.add_argument("--revision", help="independently selected full Git SHA")
+    result.add_argument("--sha256", help="independently selected archive SHA-256")
+    result.add_argument("--size", type=int, help="independently selected archive byte count")
     result.add_argument("--prefix", type=Path, required=True, help="isolated installation prefix")
     return result
 
@@ -361,13 +377,13 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = parser().parse_args()
-        if args.artifact is not None:
-            if args.receipt is None:
-                fail("Arguments", "--artifact requires --receipt")
-            value = install_release(args.artifact, args.receipt, args.prefix)
+        if args.promote_artifact is not None:
+            if args.revision is None or args.sha256 is None or args.size is None:
+                fail("Arguments", "--promote-artifact requires --revision, --sha256 and --size")
+            value = install_release(args.promote_artifact, args.revision, args.sha256, args.size, args.prefix)
         else:
-            if args.receipt is not None:
-                fail("Arguments", "--receipt is valid only with --artifact")
+            if args.revision is not None or args.sha256 is not None or args.size is not None:
+                fail("Arguments", "artifact selection flags require --promote-artifact")
             value = rollback(args.prefix) if args.rollback else status(args.prefix)
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0

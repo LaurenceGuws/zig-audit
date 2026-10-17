@@ -23,6 +23,12 @@ the architecture, style, or policy of consuming projects.
 - Avoid overlapping findings when a more specific rule already names the same sharp
   construct.
 
+## Artifact boundary
+
+- Builds come from the Git revision selected by Fleet/operator. Paste-bin only transports immutable bytes; SHA/size pins must be selected independently of the received archive.
+- The product installer accepts `--promote-artifact` plus revision, SHA-256 and size; it validates package/v2 identity and owns activation/rollback in an explicit prefix. It must not fabricate a release-pm.stage/v1 receipt or execute untrusted new installer code.
+- Preserve historical installed release-pm receipts as prior-product metadata; no new central release manager, signer or registry. The installed regular Fleet PATH command needs an explicit transition rather than a forced symlink takeover.
+
 ## Source bar
 
 Keep the implementation direct and dependency-free. Detection/acknowledgement changes

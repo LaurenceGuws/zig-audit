@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Black-box package/install/update/rollback proof for zig-audit."""
+"""Black-box source-pinned artifact install/update/rollback proof for zig-audit."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 
 
 REPO = Path(__file__).resolve().parents[1]
+TARGET = {"x86_64": "x86_64-linux", "aarch64": "aarch64-linux"}[os.uname().machine]
+OTHER_TARGET = "aarch64-linux" if TARGET == "x86_64-linux" else "x86_64-linux"
 
 
 def run(argv: list[str | Path], *, cwd: Path, expected: int = 0) -> subprocess.CompletedProcess[str]:
@@ -40,43 +44,43 @@ def fake_binary(path: Path, version: str, ruleset: int) -> None:
     path.chmod(0o700)
 
 
-def receipt(manifest: dict, artifact: Path) -> dict:
-    archive = manifest["archive"]
-    assert archive["size"] == artifact.stat().st_size
-    assert archive["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
-    return {
-        "schema": "release-pm.stage/v1",
-        "package": manifest["package"],
-        "version": manifest["version"],
-        "target": manifest["target"],
-        "release_id": manifest["release_id"],
-        "manifest_sha256": "11" * 32,
-        "size": archive["size"],
-        "sha256": archive["sha256"],
-        "signature_namespace": "trove-release-consumer-v1",
-        "trusted_key_fingerprint": "SHA256:fixture",
-        "artifact": "payload",
-        "manifest": "manifest.json",
-        "activation": "not-performed",
-        "freshness": "explicit-selection-only; no anti-rollback",
-    }
-
-
-def build_package(scratch: Path, version: str) -> tuple[Path, Path]:
-    binary = scratch / f"zig-audit-{version}"
+def build_package(scratch: Path, version: str, revision: str, target: str = TARGET) -> tuple[Path, str, int]:
+    binary = scratch / f"zig-audit-{version}-{target}"
     fake_binary(binary, version, 3)
-    out = scratch / f"package-{version}"
+    arguments = []
+    if target != TARGET:
+        native_companion = scratch / f"native-companion-{version}-{target}"
+        fake_binary(native_companion, version, 3)
+        # A cross compiler's output cannot execute here; the target's installer
+        # performs real version probes on its own CPU.
+        machine = 183 if target == "aarch64-linux" else 62
+        header = bytearray(20)
+        header[:6] = b"\x7fELF\x02\x01"
+        struct.pack_into("<H", header, 18, machine)
+        binary.write_bytes(header)
+        arguments = ["--identity-from", str(native_companion)]
+    out = scratch / f"package-{version}-{target}"
     result = run(
-        [REPO / "tools/package", "--binary", binary, "--target", "x86_64-linux", "--output", out],
+        [REPO / "tools/package", "--binary", binary, "--target", target, "--revision", revision, *arguments, "--output", out],
         cwd=REPO,
     )
     build = json.loads(result.stdout)
+    assert build["revision"] == revision
     artifact = Path(build["artifact"])
-    manifest_path = Path(build["manifest"])
-    manifest = json.loads(manifest_path.read_text())
-    receipt_path = scratch / f"receipt-{version}.json"
-    receipt_path.write_text(json.dumps(receipt(manifest, artifact), sort_keys=True) + "\n")
-    return artifact, receipt_path
+    manifest = json.loads(Path(build["manifest"]).read_text())
+    assert manifest["schema"] == "zig-audit.artifact-manifest/v1"
+    assert manifest["revision"] == revision
+    assert manifest["archive"]["size"] == artifact.stat().st_size
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert manifest["archive"]["sha256"] == digest
+    return artifact, digest, artifact.stat().st_size
+
+
+def selection(artifact: Path, revision: str, digest: str, size: int, prefix: Path) -> list[str | Path]:
+    return [
+        REPO / "install", "--promote-artifact", artifact, "--revision", revision,
+        "--sha256", digest, "--size", str(size), "--prefix", prefix,
+    ]
 
 
 def identity(binary: Path) -> dict:
@@ -85,15 +89,35 @@ def identity(binary: Path) -> dict:
     return json.loads(result.stdout)
 
 
+def error_code(argv: list[str | Path], code: str) -> None:
+    result = run(argv, cwd=REPO, expected=1)
+    assert json.loads(result.stderr)["error"]["code"] == code, result.stderr
+
+
+def historical_release(prefix: Path) -> Path:
+    """Model a retained release tree from before Paste-bin promotion."""
+    target = prefix / "releases/0.4.1"
+    (target / "bin").mkdir(parents=True)
+    fake_binary(target / "bin/zig-audit", "0.4.1", 3)
+    (target / "package.json").write_text('{"schema":"zig-audit.package/v1","version":"0.4.1"}\n')
+    old_receipt = target / "release-pm-receipt.json"
+    old_receipt.write_text('{"schema":"release-pm.stage/v1","historical":true}\n')
+    (prefix / "current").symlink_to("releases/0.4.1")
+    (prefix / "bin").mkdir()
+    (prefix / "bin/zig-audit").symlink_to("../current/bin/zig-audit")
+    return old_receipt
+
+
 def main() -> None:
     assert len(sys.argv) == 1
     cache = REPO / ".zig-cache"
     cache.mkdir(exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="install-contract-", dir=cache))
+    scratch = Path(tempfile.mkdtemp(prefix="artifact-contract-", dir=cache))
     try:
         prefix = scratch / "prefix"
-        first_artifact, first_receipt = build_package(scratch, "0.4.0")
-        second_artifact, second_receipt = build_package(scratch, "0.4.1")
+        revision = "3" * 40
+        first_artifact, first_digest, first_size = build_package(scratch, "0.4.0", revision)
+        second_artifact, second_digest, second_size = build_package(scratch, "0.4.2", revision)
 
         missing_status = run(
             [REPO / "install", "--status", "--prefix", scratch / "missing-prefix"],
@@ -103,66 +127,86 @@ def main() -> None:
         assert json.loads(missing_status.stderr)["error"]["code"] == "PrefixUnavailable"
         assert not (scratch / "missing-prefix").exists()
 
-        first = run(
-            [REPO / "install", "--artifact", first_artifact, "--receipt", first_receipt, "--prefix", prefix],
-            cwd=REPO,
-        )
-        first_result = json.loads(first.stdout)
-        assert first.stderr == ""
-        assert first_result["operation"] == "install"
-        assert first_result["version"] == "0.4.0"
-        assert first_result["previous"] is None
+        first = json.loads(run(selection(first_artifact, revision, first_digest, first_size, prefix), cwd=REPO).stdout)
+        assert first["operation"] == "install"
+        assert first["version"] == "0.4.0"
+        assert first["revision"] == revision
+        assert first["previous"] is None
         assert identity(prefix / "bin/zig-audit")["version"] == "0.4.0"
+        receipt = json.loads((prefix / "releases/0.4.0/artifact.json").read_text())
+        assert receipt == {
+            "schema": "zig-audit.artifact/v1", "package": "zig-audit",
+            "version": "0.4.0", "target": TARGET, "revision": revision,
+            "sha256": first_digest, "size": first_size,
+            "trust": "operator-pinned-source-build-not-signed",
+        }
+        assert not (prefix / "releases/0.4.0/release-pm-receipt.json").exists()
 
-        second = run(
-            [REPO / "install", "--artifact", second_artifact, "--receipt", second_receipt, "--prefix", prefix],
-            cwd=REPO,
-        )
-        second_result = json.loads(second.stdout)
-        assert second_result["version"] == "0.4.1"
-        assert second_result["previous"] == "releases/0.4.0"
-        assert identity(prefix / "bin/zig-audit")["version"] == "0.4.1"
+        second = json.loads(run(selection(second_artifact, revision, second_digest, second_size, prefix), cwd=REPO).stdout)
+        assert second["version"] == "0.4.2"
+        assert second["previous"] == "releases/0.4.0"
+        assert identity(prefix / "bin/zig-audit")["version"] == "0.4.2"
 
         status = json.loads(run([REPO / "install", "--status", "--prefix", prefix], cwd=REPO).stdout)
-        assert status["active"] == "releases/0.4.1"
+        assert status["active"] == "releases/0.4.2"
         assert status["previous"] == "releases/0.4.0"
-        assert status["releases"] == ["0.4.0", "0.4.1"]
+        assert status["releases"] == ["0.4.0", "0.4.2"]
 
         rollback = json.loads(run([REPO / "install", "--rollback", "--prefix", prefix], cwd=REPO).stdout)
         assert rollback["version"] == "0.4.0"
         assert rollback["active"] == "releases/0.4.0"
-        assert rollback["previous"] == "releases/0.4.1"
+        assert rollback["previous"] == "releases/0.4.2"
         assert identity(prefix / "bin/zig-audit")["version"] == "0.4.0"
 
-        # Rollback is a swap, so a second rollback returns to the newer retained release.
         rollback_again = json.loads(run([REPO / "install", "--rollback", "--prefix", prefix], cwd=REPO).stdout)
-        assert rollback_again["version"] == "0.4.1"
-        assert identity(prefix / "bin/zig-audit")["version"] == "0.4.1"
+        assert rollback_again["version"] == "0.4.2"
+        assert identity(prefix / "bin/zig-audit")["version"] == "0.4.2"
 
-        # Existing release trees are immutable from the installer's perspective.
-        repeated = run(
-            [REPO / "install", "--artifact", first_artifact, "--receipt", first_receipt, "--prefix", prefix],
-            cwd=REPO,
-            expected=1,
-        )
-        repeated_error = json.loads(repeated.stderr)
-        assert repeated.stdout == ""
-        assert repeated_error["error"]["code"] == "ReleaseExists"
-
+        error_code(selection(first_artifact, revision, first_digest, first_size, prefix), "ReleaseExists")
         tampered = scratch / "tampered.tar.xz"
         shutil.copy2(second_artifact, tampered)
         with tampered.open("ab") as stream:
             stream.write(b"x")
-        tampered_result = run(
-            [REPO / "install", "--artifact", tampered, "--receipt", second_receipt, "--prefix", scratch / "tampered-prefix"],
-            cwd=REPO,
-            expected=1,
-        )
-        assert json.loads(tampered_result.stderr)["error"]["code"] == "ArtifactMismatch"
+        error_code(selection(tampered, revision, second_digest, second_size, scratch / "tampered-prefix"), "ArtifactMismatch")
+        assert not (scratch / "tampered-prefix").exists()
+        error_code(selection(second_artifact, revision, "f" * 64, second_size, scratch / "wrong-hash"), "ArtifactMismatch")
+        error_code(selection(second_artifact, revision, second_digest, second_size + 1, scratch / "wrong-size"), "ArtifactMismatch")
+        error_code(selection(second_artifact, "4" * 40, second_digest, second_size, scratch / "wrong-revision"), "RevisionMismatch")
+        error_code(selection(second_artifact, revision, "incorrect", second_size, scratch / "bad-pins"), "InvalidSelection")
+        other_artifact, other_digest, other_size = build_package(scratch, "0.4.3", revision, OTHER_TARGET)
+        error_code(selection(other_artifact, revision, other_digest, other_size, scratch / "wrong-target"), "WrongTarget")
 
-        assert (prefix / "releases/0.4.0/release-pm-receipt.json").is_file()
-        assert (prefix / "releases/0.4.1/release-pm-receipt.json").is_file()
-        print("PASS zig-audit package/install lifecycle")
+        no_pins = run(
+            [REPO / "install", "--promote-artifact", second_artifact, "--prefix", scratch / "no-pins"],
+            cwd=REPO, expected=1,
+        )
+        assert json.loads(no_pins.stderr)["error"]["code"] == "Arguments"
+        assert not (scratch / "no-pins").exists()
+
+        obsolete = run(
+            [REPO / "install", "--artifact", second_artifact, "--receipt", second_artifact, "--prefix", scratch / "obsolete"],
+            cwd=REPO, expected=2,
+        )
+        assert obsolete.returncode == 2
+        assert not (scratch / "obsolete").exists()
+
+        occupied = scratch / "occupied"
+        (occupied / "bin").mkdir(parents=True)
+        fake_binary(occupied / "bin/zig-audit", "0.0.1", 1)
+        error_code(selection(second_artifact, revision, second_digest, second_size, occupied), "InvalidState")
+        assert identity(occupied / "bin/zig-audit")["version"] == "0.0.1"
+
+        old_prefix = scratch / "historical"
+        history = historical_release(old_prefix)
+        prior_bytes = history.read_bytes()
+        newer = json.loads(run(selection(second_artifact, revision, second_digest, second_size, old_prefix), cwd=REPO).stdout)
+        assert newer["previous"] == "releases/0.4.1"
+        assert history.read_bytes() == prior_bytes
+        run([REPO / "install", "--rollback", "--prefix", old_prefix], cwd=REPO)
+        assert identity(old_prefix / "bin/zig-audit")["version"] == "0.4.1"
+        assert history.read_bytes() == prior_bytes
+
+        print("PASS zig-audit pinned-artifact/install lifecycle and historical rollback")
     finally:
         shutil.rmtree(scratch)
 
