@@ -4,14 +4,33 @@ const std = @import("std");
 
 /// Defines zig-audit build, test, and self-audit steps.
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Distribution is one portable executable per architecture, never the builder's native ISA.
+    const default_target: std.Target.Query = if (@import("builtin").target.cpu.arch == .x86_64)
+        .{ .cpu_model = .baseline }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    if (target.result.cpu.arch == .x86_64 and optimize != .debug) {
+        const portable_cpu = switch (target.query.cpu_model) {
+            .baseline => true,
+            .determined_by_arch_os => target.query.cpu_arch != null,
+            else => false,
+        };
+        if (!portable_cpu or !target.query.cpu_features_add.isEmpty()) {
+            // zig-audit: acknowledge panic
+            // reason: A release artifact targeting native builder CPU features can SIGILL on another Fleet node.
+            @panic("zig-audit release requires baseline x86_64 CPU; use -Dcpu=baseline");
+        }
+    }
+    const strip = b.option(bool, "strip", "Strip executable debug information") orelse false;
     const self_hosted = target.result.cpu.arch == .x86_64;
 
     const module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     const executable = b.addExecutable(.{
         .name = "zig-audit",

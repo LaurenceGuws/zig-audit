@@ -156,9 +156,13 @@ unavailable for schema 2.
 
 ## Install
 
+The experimental direct-download GitHub-manifest installer from the earlier `0.3.1` development line was superseded by the release-pm staging contract. Its commits remain reachable through the merged Git history, but the obsolete pilot tooling was removed rather than maintained as a second, competing installation API. The build's opt-in strip flag was retained.
+
 Release packages are prebuilt and owner-installed. `release-pm` authenticates and
 stages the archive; zig-audit owns archive validation, target-native version probes,
 activation, rollback, and retention inside an explicit prefix.
+
+Build releases with a baseline x86_64 CPU profile, never the builder's native features. Optimized builds reject `-Dcpu=native` to protect heterogeneous Fleet hosts.
 
 Build a release binary with the repository's pinned Zig compiler:
 
