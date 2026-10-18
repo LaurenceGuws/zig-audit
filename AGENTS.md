@@ -27,7 +27,8 @@ the architecture, style, or policy of consuming projects.
 
 - Builds come from the Git revision selected by Fleet/operator. Paste-bin only transports immutable bytes; SHA/size pins must be selected independently of the received archive.
 - The product installer accepts `--promote-artifact` plus revision, SHA-256 and size; it validates package/v2 identity and owns activation/rollback in an explicit prefix. It must not fabricate a release-pm.stage/v1 receipt or execute untrusted new installer code.
-- Preserve historical installed release-pm receipts as prior-product metadata; no new central release manager, signer or registry. The installed regular Fleet PATH command needs an explicit transition rather than a forced symlink takeover.
+- After promotion, PATH is one regular `bin/zig-audit` executable, with at most one exact `share/zig-audit/previous/zig-audit` backup. No accumulated releases, pointer symlinks, or historical receipts. Inspect and retire only known legacy trees after a recoverable activation.
+- The old unrecorded 0.4.1 source-cutover command (or a legacy release lacking a binary digest) requires an explicit `--adopt-current-sha256` from an independently selected existing-binary hash. Do not silently take over unknown binaries, introduce a release manager, signer, or registry, or promote live Fleet commands without an attended approval.
 
 ## Source bar
 

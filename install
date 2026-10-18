@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -13,12 +15,10 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 
 
 PACKAGE = "zig-audit"
 PACKAGE_SCHEMA = "zig-audit.package/v2"
-ARTIFACT_SCHEMA = "zig-audit.artifact/v1"
 STATE_SCHEMA = "zig-audit.install/v1"
 
 
@@ -72,8 +72,9 @@ def private_prefix(prefix: Path, *, create: bool) -> Path:
     elif not candidate.exists():
         fail("PrefixUnavailable", "installation prefix does not exist", prefix=str(candidate))
     prefix = candidate.resolve()
-    if not prefix.is_dir():
-        fail("UnsafePrefix", "installation prefix must be a directory", prefix=str(prefix))
+    stat = prefix.stat()
+    if not prefix.is_dir() or stat.st_uid not in (os.getuid(), 0) or stat.st_mode & 0o022:
+        fail("UnsafePrefix", "prefix must be owned and not writable by group or others", prefix=str(prefix))
     return prefix
 
 
@@ -183,181 +184,392 @@ def validate_package(metadata: dict, binary: Path, selected_revision: str) -> tu
     return version, target, ruleset
 
 
-def replace_symlink(path: Path, target: str) -> None:
+# Fixed current/previous commands replace the obsolete version trees. A small,
+# ephemeral transaction record survives a crash between PATH replacement and
+# metadata/rollback publication. It is not rollout history.
+LOCAL_SCHEMA = "zig-audit.local/v1"
+TRANSITION_SCHEMA = "zig-audit.transition/v1"
+LEGACY_ENTRYPOINT = "../current/bin/zig-audit"
+
+
+@contextmanager
+def exclusive_installation(prefix: Path):
+    fd = os.open(prefix, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail("Busy", "another zig-audit installer owns this prefix")
+        yield
+    finally:
+        os.close(fd)
+
+
+def ensure_layout(prefix: Path) -> Path:
+    for directory in (prefix / "bin", prefix / "share", prefix / "share/zig-audit"):
+        if directory.is_symlink():
+            fail("UnsafePrefix", "installer directory must not be a symlink", path=str(directory))
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if not directory.is_dir():
+            fail("UnsafePrefix", "installer directory is not a directory", path=str(directory))
+    return prefix / "share/zig-audit"
+
+
+def write_json(path: Path, value: dict) -> None:
     temp = path.with_name(f".{path.name}.new.{os.getpid()}")
     try:
-        temp.unlink(missing_ok=True)
-        temp.symlink_to(target)
+        with temp.open("xb") as output:
+            output.write((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
+            output.flush()
+            os.fsync(output.fileno())
+        temp.chmod(0o600)
         os.replace(temp, path)
     finally:
         temp.unlink(missing_ok=True)
 
 
-def read_link(path: Path) -> str | None:
+def probe_identity(binary: Path) -> dict:
+    responses = []
+    for alias in ("-v", "--version"):
+        try:
+            result = subprocess.run([binary, alias], capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            fail("BinaryRejected", "zig-audit version probe could not execute", alias=alias)
+        if result.returncode or result.stderr:
+            fail("BinaryRejected", "zig-audit version probe failed", alias=alias)
+        try:
+            responses.append(json.loads(result.stdout))
+        except json.JSONDecodeError:
+            fail("BinaryRejected", "zig-audit version output was not JSON", alias=alias)
+    if responses[0] != responses[1]:
+        fail("BinaryRejected", "zig-audit version aliases disagree")
+    identity = responses[0]
+    if not isinstance(identity, dict) or set(identity) != {"schema", "version", "stable_ruleset"} or identity["schema"] != "zig-audit.version/v1":
+        fail("BinaryRejected", "zig-audit version identity is invalid")
+    if not isinstance(identity["version"], str) or re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", identity["version"]) is None:
+        fail("BinaryRejected", "zig-audit version string is invalid")
+    if type(identity["stable_ruleset"]) is not int or identity["stable_ruleset"] < 1:
+        fail("BinaryRejected", "zig-audit ruleset identity is invalid")
+    return identity
+
+
+def checked_local_identity(binary: Path, meta: dict) -> dict:
+    if set(meta) != {"schema", "package", "version", "target", "revision", "sha256", "stable_ruleset"} or meta["schema"] != LOCAL_SCHEMA or meta["package"] != PACKAGE:
+        fail("InvalidState", "installed binary owner record is malformed")
+    if meta["target"] != native_target() or not isinstance(meta["version"], str) or re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", meta["version"]) is None:
+        fail("InvalidState", "installed binary target/version is invalid")
+    revision = meta["revision"]
+    if revision is not None and (not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None):
+        fail("InvalidState", "installed binary source revision is invalid")
+    if not isinstance(meta["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", meta["sha256"]) is None or type(meta["stable_ruleset"]) is not int:
+        fail("InvalidState", "installed binary digest/ruleset is invalid")
+    if binary.is_symlink() or not binary.is_file() or sha256(binary) != meta["sha256"]:
+        fail("InvalidState", "installed binary differs from its product owner record")
+    ident = probe_identity(binary)
+    if ident["version"] != meta["version"] or ident["stable_ruleset"] != meta["stable_ruleset"]:
+        fail("InvalidState", "installed executable identity differs from its owner record")
+    return meta
+
+
+def legacy_identity(binary: Path, metadata: dict | None, adopt_sha: str | None) -> dict:
+    if binary.is_symlink() or not binary.is_file():
+        fail("InvalidLegacyInstall", "legacy executable is not a regular file")
+    ident = probe_identity(binary)
+    if metadata is None:
+        if ident != {"schema": "zig-audit.version/v1", "version": "0.4.1", "stable_ruleset": 3}:
+            fail("InvalidLegacyInstall", "unrecorded regular binary is not the supported 0.4.1 source cutover")
+        revision = None
+        product_hash = None
+    else:
+        if metadata.get("schema") not in (PACKAGE_SCHEMA, "zig-audit.package/v1") or metadata.get("version") != ident["version"] or metadata.get("package", PACKAGE) != PACKAGE:
+            fail("InvalidLegacyInstall", "legacy release package identity does not match executable")
+        if metadata.get("target", native_target()) != native_target():
+            fail("InvalidLegacyInstall", "legacy release targets another architecture")
+        product_hash = metadata.get("binary_sha256")
+        revision = metadata.get("revision")
+        if revision is not None and (not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None):
+            fail("InvalidLegacyInstall", "legacy release revision is invalid")
+        if metadata.get("stable_ruleset", ident["stable_ruleset"]) != ident["stable_ruleset"]:
+            fail("InvalidLegacyInstall", "legacy release ruleset is inconsistent")
+    digest = sha256(binary)
+    if product_hash is not None and product_hash != digest:
+        fail("InvalidLegacyInstall", "legacy executable differs from its package metadata")
+    if product_hash is None:
+        if adopt_sha is None:
+            fail("AdoptionRequired", "unrecorded legacy binary requires an independently selected --adopt-current-sha256", observed_sha256=digest)
+        if re.fullmatch(r"[0-9a-f]{64}", adopt_sha) is None or adopt_sha != digest:
+            fail("ExistingBinaryMismatch", "selected old executable digest does not match installed bytes")
+    elif adopt_sha is not None and adopt_sha != digest:
+        fail("ExistingBinaryMismatch", "selected old executable digest does not match installed bytes")
+    return {
+        "schema": LOCAL_SCHEMA, "package": PACKAGE, "version": ident["version"],
+        "target": native_target(), "revision": revision, "sha256": digest,
+        "stable_ruleset": ident["stable_ruleset"],
+    }
+
+
+def current_identity(prefix: Path, data: Path, adopt_sha: str | None = None) -> tuple[Path, dict] | None:
+    stable = prefix / "bin/zig-audit"
+    if not stable.exists() and not stable.is_symlink():
+        if (data / "installed.json").exists() or (prefix / "current").exists() or (prefix / "current").is_symlink():
+            fail("InvalidState", "owned command metadata exists without PATH executable")
+        return None
+    if stable.is_symlink():
+        if os.readlink(stable) != LEGACY_ENTRYPOINT:
+            fail("InvalidState", "PATH entry is a foreign symlink")
+        current = prefix / "current"
+        if not current.is_symlink():
+            fail("InvalidState", "legacy current pointer is missing")
+        version_path = os.readlink(current)
+        if re.fullmatch(r"releases/[0-9]+[.][0-9]+[.][0-9]+", version_path) is None:
+            fail("InvalidState", "legacy current pointer is foreign")
+        release = prefix / version_path
+        package = load_json(release / "package.json")
+        return release / "bin/zig-audit", legacy_identity(release / "bin/zig-audit", package, adopt_sha)
+    if not stable.is_file():
+        fail("InvalidState", "PATH entry is not regular")
+    local = data / "installed.json"
+    if local.is_file() and not local.is_symlink():
+        if adopt_sha is not None:
+            fail("InvalidSelection", "adoption pin is only valid for an unrecorded legacy command")
+        return stable, checked_local_identity(stable, load_json(local))
+    if local.exists() or local.is_symlink():
+        fail("InvalidState", "installed owner record is foreign")
+    return stable, legacy_identity(stable, None, adopt_sha)
+
+
+def previous_identity(data: Path) -> dict | None:
+    path = data / "previous"
     if not path.exists() and not path.is_symlink():
         return None
-    if not path.is_symlink():
-        fail("InvalidState", "activation pointer is not a symlink", path=str(path))
-    target = os.readlink(path)
-    if Path(target).is_absolute() or ".." in Path(target).parts:
-        fail("InvalidState", "activation pointer has unsafe target", path=str(path), target=target)
-    return target
+    if path.is_symlink() or not path.is_dir():
+        fail("InvalidState", "previous backup is foreign")
+    return checked_local_identity(path / "zig-audit", load_json(path / "installed.json"))
 
 
-def write_json(path: Path, value: dict) -> None:
-    temp = path.with_name(f".{path.name}.new.{os.getpid()}")
-    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    with temp.open("xb") as output:
-        output.write(data)
-        output.flush()
-        os.fsync(output.fileno())
-    temp.chmod(0o600)
-    os.replace(temp, path)
+def preflight_legacy_cleanup(prefix: Path) -> None:
+    releases = prefix / "releases"
+    if releases.is_symlink():
+        fail("InvalidState", "legacy release root is a symlink")
+    if releases.exists():
+        if not releases.is_dir():
+            fail("InvalidState", "legacy release root is not a directory")
+        for release in releases.iterdir():
+            if release.is_symlink() or not release.is_dir() or re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", release.name) is None:
+                fail("InvalidState", "legacy release has foreign directory")
+            allowed = {"bin", "package.json", "artifact.json", "release-pm-receipt.json"}
+            if any(part.name not in allowed or part.is_symlink() for part in release.iterdir()):
+                fail("InvalidState", "legacy release has unowned content")
+            bindir = release / "bin"
+            if bindir.is_symlink() or not bindir.is_dir() or {p.name for p in bindir.iterdir()} != {"zig-audit"}:
+                fail("InvalidState", "legacy release binary inventory is invalid")
+            binary = bindir / "zig-audit"
+            if binary.is_symlink() or not binary.is_file():
+                fail("InvalidState", "legacy release binary is foreign")
+            package = load_json(release / "package.json")
+            if package.get("schema") not in ("zig-audit.package/v1", PACKAGE_SCHEMA) or package.get("version") != release.name or package.get("package", PACKAGE) != PACKAGE:
+                fail("InvalidState", "legacy release identity is inconsistent")
+            if package.get("binary_sha256") is not None and package["binary_sha256"] != sha256(binary):
+                fail("InvalidState", "legacy release binary digest differs from owner metadata")
+            for file in ("artifact.json", "release-pm-receipt.json"):
+                path = release / file
+                if path.exists() and (path.is_symlink() or not path.is_file()):
+                    fail("InvalidState", "legacy release metadata is not regular")
+    for name in ("current", "previous"):
+        path = prefix / name
+        if path.is_symlink():
+            if re.fullmatch(r"releases/[0-9]+[.][0-9]+[.][0-9]+", os.readlink(path)) is None:
+                fail("InvalidState", "legacy activation pointer is foreign")
+        elif path.exists():
+            fail("InvalidState", "legacy activation pointer is not a symlink")
+    work = prefix / ".work"
+    if work.exists() and (work.is_symlink() or not work.is_dir() or any(work.iterdir())):
+        fail("InvalidState", "legacy staging path is not empty/owned")
+    operation = prefix / "last-operation.json"
+    if operation.exists() and (operation.is_symlink() or not operation.is_file()):
+        fail("InvalidState", "legacy operation metadata is foreign")
 
 
-def ensure_entrypoint(prefix: Path) -> None:
-    bindir = prefix / "bin"
-    bindir.mkdir(mode=0o700, exist_ok=True)
-    entrypoint = bindir / PACKAGE
-    expected = "../current/bin/zig-audit"
-    if entrypoint.exists() or entrypoint.is_symlink():
-        if not entrypoint.is_symlink() or os.readlink(entrypoint) != expected:
-            fail("InvalidState", "stable entrypoint is occupied by foreign data", path=str(entrypoint))
+def remove_legacy_release_tree(prefix: Path) -> None:
+    for name in ("current", "previous"):
+        path = prefix / name
+        if path.is_symlink():
+            path.unlink()
+    releases = prefix / "releases"
+    if releases.is_dir() and not releases.is_symlink():
+        shutil.rmtree(releases)
+    work = prefix / ".work"
+    if work.is_dir() and not work.is_symlink():
+        shutil.rmtree(work)
+    operation = prefix / "last-operation.json"
+    if operation.is_file() and not operation.is_symlink():
+        operation.unlink()
+
+
+def finalize_transition(prefix: Path, intent: dict) -> None:
+    data = prefix / "share/zig-audit"
+    stable = prefix / "bin/zig-audit"
+    work = data / ".transition"
+    checked_local_identity(stable, intent["new"])
+    write_json(data / "installed.json", intent["new"])
+    previous = data / "previous"
+    staged = work / "previous"
+    if staged.is_dir() and not staged.is_symlink():
+        if previous.is_dir() and not previous.is_symlink():
+            shutil.rmtree(previous)
+        elif previous.exists() or previous.is_symlink():
+            fail("InvalidState", "previous checkpoint is foreign")
+        os.replace(staged, previous)
+    elif intent["old"] is not None:
+        checked_local_identity(previous / "zig-audit", intent["old"])
+    elif previous.exists() or previous.is_symlink():
+        fail("InvalidState", "unexpected previous backup")
+    if intent["operation"] == "install":
+        remove_legacy_release_tree(prefix)
+    shutil.rmtree(work)
+
+
+def recover_transition(prefix: Path) -> None:
+    data = prefix / "share/zig-audit"
+    work = data / ".transition"
+    if not work.exists() and not work.is_symlink():
         return
-    entrypoint.symlink_to(expected)
+    if work.is_symlink() or not work.is_dir():
+        fail("InterruptedInstall", "transition path is foreign")
+    receipt = work / "intent.json"
+    if not receipt.is_file() or receipt.is_symlink():
+        fail("InterruptedInstall", "incomplete pre-activation staging needs inspection")
+    intent = load_json(receipt)
+    if set(intent) != {"schema", "operation", "old", "new"} or intent["schema"] != TRANSITION_SCHEMA or intent["operation"] not in ("install", "rollback"):
+        fail("InterruptedInstall", "transition record is invalid")
+    stable = prefix / "bin/zig-audit"
+    new = intent["new"]
+    old = intent["old"]
+    if stable.is_file() and not stable.is_symlink() and sha256(stable) == new.get("sha256"):
+        finalize_transition(prefix, intent)
+    elif (old is None and not stable.exists() and not stable.is_symlink()) or (
+        old is not None and stable.is_file() and sha256(stable) == old.get("sha256")
+    ) or (
+        old is not None and stable.is_symlink() and os.readlink(stable) == LEGACY_ENTRYPOINT and sha256(stable) == old.get("sha256")
+    ):
+        shutil.rmtree(work)
+    else:
+        fail("InterruptedInstall", "PATH binary matches neither old nor selected new artifact")
+
+
+def activate(prefix: Path, operation: str, old: dict | None, new: dict, candidate: Path) -> None:
+    data = prefix / "share/zig-audit"
+    work = data / ".transition"
+    write_json(work / "intent.json", {
+        "schema": TRANSITION_SCHEMA, "operation": operation, "old": old, "new": new,
+    })
+    os.replace(candidate, prefix / "bin/zig-audit")
+    try:
+        finalize_transition(prefix, load_json(work / "intent.json"))
+    except (InstallError, OSError, subprocess.SubprocessError) as exc:
+        fail("ActivationIncomplete", "PATH switched but finalization needs recovery with --status", cause=type(exc).__name__)
 
 
 def install_release(
     artifact_arg: Path, selected_revision: str, selected_sha: str,
-    selected_size: int, prefix_arg: Path,
+    selected_size: int, prefix_arg: Path, adopt_sha: str | None = None,
 ) -> dict:
     artifact = verify_selected_artifact(artifact_arg, selected_revision, selected_sha, selected_size)
     prefix = private_prefix(prefix_arg, create=True)
-    releases = prefix / "releases"
-    releases.mkdir(mode=0o700, exist_ok=True)
-
-    work_parent = prefix / ".work"
-    work_parent.mkdir(mode=0o700, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="install-", dir=work_parent) as temp_name:
-        temp = Path(temp_name)
-        metadata, staged_binary = extract_package(artifact, temp)
-        version, target, ruleset = validate_package(metadata, staged_binary, selected_revision)
-        destination = releases / version
-        if destination.exists() or destination.is_symlink():
-            fail("ReleaseExists", "release tree already exists; installer never overwrites it", version=version)
-        candidate = releases / f".{version}.new.{os.getpid()}"
-        candidate.mkdir(mode=0o700)
-        try:
-            (candidate / "bin").mkdir(mode=0o700)
-            shutil.copy2(staged_binary, candidate / "bin/zig-audit")
-            (candidate / "bin/zig-audit").chmod(0o700)
-            write_json(candidate / "artifact.json", {
-                "schema": ARTIFACT_SCHEMA,
-                "package": PACKAGE,
-                "version": version,
-                "target": target,
-                "revision": selected_revision,
-                "sha256": selected_sha,
-                "size": selected_size,
-                "trust": "operator-pinned-source-build-not-signed",
-            })
-            write_json(candidate / "package.json", metadata)
-            os.replace(candidate, destination)
-        finally:
-            if candidate.exists():
-                shutil.rmtree(candidate)
-
-    ensure_entrypoint(prefix)
-    current = prefix / "current"
-    previous = prefix / "previous"
-    old_current = read_link(current)
-    new_target = f"releases/{version}"
-    if old_current == new_target:
-        fail("AlreadyActive", "release is already active", version=version)
-    if old_current is not None:
-        replace_symlink(previous, old_current)
-    replace_symlink(current, new_target)
-
-    activated = prefix / "bin/zig-audit"
-    identity = json.loads(subprocess.run(
-        [activated, "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=10,
-        check=True,
-    ).stdout)
-    if identity["version"] != version:
-        fail("ActivationFailed", "stable entrypoint does not resolve to installed release")
-
-    result = {
-        "schema": STATE_SCHEMA,
-        "operation": "install",
-        "package": PACKAGE,
-        "version": version,
-        "target": target,
-        "revision": selected_revision,
-        "stable_ruleset": ruleset,
-        "prefix": str(prefix),
-        "active": new_target,
-        "previous": old_current,
-        "retention": "all release trees retained",
+    data = ensure_layout(prefix)
+    recover_transition(prefix)
+    work = data / ".transition"
+    work.mkdir(mode=0o700)
+    try:
+        metadata, candidate = extract_package(artifact, work)
+        version, target, ruleset = validate_package(metadata, candidate, selected_revision)
+        old = current_identity(prefix, data, adopt_sha)
+        previous_identity(data)
+        preflight_legacy_cleanup(prefix)
+        if old is not None and old[1]["version"] == version:
+            fail("ReleaseExists", "same version already installed; select a new version")
+        if old is not None:
+            previous = work / "previous"
+            previous.mkdir(mode=0o700)
+            shutil.copy2(old[0], previous / "zig-audit")
+            (previous / "zig-audit").chmod(0o755)
+            write_json(previous / "installed.json", old[1])
+        current = {
+            "schema": LOCAL_SCHEMA, "package": PACKAGE, "version": version,
+            "target": target, "revision": selected_revision, "sha256": sha256(candidate),
+            "stable_ruleset": ruleset,
+        }
+        activate(prefix, "install", old[1] if old else None, current, candidate)
+    except BaseException:
+        if not (work / "intent.json").exists() and work.is_dir():
+            shutil.rmtree(work)
+        raise
+    return {
+        "schema": STATE_SCHEMA, "operation": "install", "package": PACKAGE,
+        "version": version, "revision": selected_revision, "target": target,
+        "stable_ruleset": ruleset, "prefix": str(prefix),
+        "active": str(prefix / "bin/zig-audit"),
+        "previous": str(data / "previous/zig-audit") if old is not None else None,
+        "retention": "one current regular executable and at most one previous",
     }
-    write_json(prefix / "last-operation.json", result)
-    return result
 
 
 def rollback(prefix_arg: Path) -> dict:
     prefix = private_prefix(prefix_arg, create=False)
-    current = prefix / "current"
-    previous = prefix / "previous"
-    current_target = read_link(current)
-    previous_target = read_link(previous)
-    if current_target is None or previous_target is None:
-        fail("RollbackUnavailable", "both current and previous releases are required for rollback")
-    target_binary = prefix / previous_target / "bin/zig-audit"
-    if not target_binary.is_file() or target_binary.is_symlink():
-        fail("InvalidState", "previous release binary is unavailable", path=str(target_binary))
-    replace_symlink(current, previous_target)
-    replace_symlink(previous, current_target)
-    identity = json.loads(subprocess.run(
-        [prefix / "bin/zig-audit", "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=10,
-        check=True,
-    ).stdout)
-    result = {
-        "schema": STATE_SCHEMA,
-        "operation": "rollback",
-        "package": PACKAGE,
-        "version": identity["version"],
-        "prefix": str(prefix),
-        "active": previous_target,
-        "previous": current_target,
-        "retention": "all release trees retained",
+    data = ensure_layout(prefix)
+    recover_transition(prefix)
+    stable = prefix / "bin/zig-audit"
+    current = current_identity(prefix, data)
+    old = previous_identity(data)
+    if current is None or old is None:
+        fail("RollbackUnavailable", "one current and one previous binary are required")
+    work = data / ".transition"
+    work.mkdir(mode=0o700)
+    try:
+        candidate = work / "zig-audit"
+        shutil.copy2(data / "previous/zig-audit", candidate)
+        candidate.chmod(0o755)
+        staged = work / "previous"
+        staged.mkdir(mode=0o700)
+        shutil.copy2(stable, staged / "zig-audit")
+        (staged / "zig-audit").chmod(0o755)
+        write_json(staged / "installed.json", current[1])
+        activate(prefix, "rollback", current[1], old, candidate)
+    except BaseException:
+        if not (work / "intent.json").exists() and work.is_dir():
+            shutil.rmtree(work)
+        raise
+    return {
+        "schema": STATE_SCHEMA, "operation": "rollback", "package": PACKAGE,
+        "version": old["version"], "prefix": str(prefix),
+        "active": str(stable), "previous": str(data / "previous/zig-audit"),
+        "retention": "one current regular executable and at most one previous",
     }
-    write_json(prefix / "last-operation.json", result)
-    return result
 
 
 def status(prefix_arg: Path) -> dict:
     prefix = private_prefix(prefix_arg, create=False)
-    current = read_link(prefix / "current")
-    previous = read_link(prefix / "previous")
-    releases = []
-    release_root = prefix / "releases"
-    if release_root.is_dir():
-        releases = sorted(entry.name for entry in release_root.iterdir() if entry.is_dir() and not entry.is_symlink())
+    data = prefix / "share/zig-audit"
+    recover_transition(prefix)
+    adoption_required = False
+    observed_sha256 = None
+    try:
+        current = current_identity(prefix, data)
+    except InstallError as exc:
+        if exc.code != "AdoptionRequired":
+            raise
+        adoption_required = True
+        observed_sha256 = exc.details["observed_sha256"]
+        current = None
+    previous = previous_identity(data)
     return {
-        "schema": STATE_SCHEMA,
-        "operation": "status",
-        "package": PACKAGE,
+        "schema": STATE_SCHEMA, "operation": "status", "package": PACKAGE,
         "prefix": str(prefix),
-        "active": current,
-        "previous": previous,
-        "releases": releases,
+        "active": current[1]["version"] if current else ("unadopted-legacy" if adoption_required else None),
+        "previous": previous["version"] if previous else ("legacy-release-managed" if (prefix / "previous").is_symlink() else None),
+        "installed_path": str(prefix / "bin/zig-audit"),
+        "adoption_required": adoption_required,
+        "observed_sha256": observed_sha256,
     }
 
 
@@ -365,26 +577,34 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="zig-audit-artifact-install")
     mode = result.add_mutually_exclusive_group(required=True)
     mode.add_argument("--promote-artifact", type=Path, help="prebuilt archive from a selected source revision")
-    mode.add_argument("--rollback", action="store_true", help="activate the previous retained release")
-    mode.add_argument("--status", action="store_true", help="inspect isolated-prefix activation state")
+    mode.add_argument("--rollback", action="store_true", help="swap with the one saved previous executable")
+    mode.add_argument("--status", action="store_true", help="inspect the current and one previous executable")
     result.add_argument("--revision", help="independently selected full Git SHA")
     result.add_argument("--sha256", help="independently selected archive SHA-256")
     result.add_argument("--size", type=int, help="independently selected archive byte count")
-    result.add_argument("--prefix", type=Path, required=True, help="isolated installation prefix")
+    result.add_argument("--adopt-current-sha256", help="explicit independent hash of the older unrecorded PATH command")
+    result.add_argument("--prefix", type=Path, required=True, help="installation prefix")
     return result
 
 
 def main() -> int:
     try:
         args = parser().parse_args()
+        if args.promote_artifact is not None and (args.revision is None or args.sha256 is None or args.size is None):
+            fail("Arguments", "--promote-artifact requires --revision, --sha256 and --size")
+        if args.promote_artifact is None and any(value is not None for value in (args.revision, args.sha256, args.size, args.adopt_current_sha256)):
+            fail("Arguments", "artifact and adoption pins require --promote-artifact")
+        if args.adopt_current_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", args.adopt_current_sha256) is None:
+            fail("InvalidSelection", "old command SHA-256 pin is invalid")
         if args.promote_artifact is not None:
-            if args.revision is None or args.sha256 is None or args.size is None:
-                fail("Arguments", "--promote-artifact requires --revision, --sha256 and --size")
-            value = install_release(args.promote_artifact, args.revision, args.sha256, args.size, args.prefix)
-        else:
-            if args.revision is not None or args.sha256 is not None or args.size is not None:
-                fail("Arguments", "artifact selection flags require --promote-artifact")
-            value = rollback(args.prefix) if args.rollback else status(args.prefix)
+            # Reject bad or missing operator selection before creating a prefix.
+            verify_selected_artifact(args.promote_artifact, args.revision, args.sha256, args.size)
+        lock_prefix = private_prefix(args.prefix, create=args.promote_artifact is not None)
+        with exclusive_installation(lock_prefix):
+            if args.promote_artifact is not None:
+                value = install_release(args.promote_artifact, args.revision, args.sha256, args.size, lock_prefix, args.adopt_current_sha256)
+            else:
+                value = rollback(lock_prefix) if args.rollback else status(lock_prefix)
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0
     except InstallError as exc:

@@ -163,15 +163,17 @@ unavailable for schema 2.
 
 ## Build-once artifact installation via Paste-bin
 
-zig-audit owns a small deterministic prebuilt archive, its validation,
-immutable release trees and rollback. Fleet or the operator owns source-revision
-selection, building, the ephemeral Paste-bin handoff and **independently
-selected** expected archive hash and size. No central release manager or signer
-is involved.
+zig-audit builds one deterministic prebuilt archive per architecture. Fleet or
+the operator chooses the source revision, builds the artifact and independently
+selects its archive SHA-256 and byte size. Paste-bin transfers those immutable
+bytes. A digest confirms the selected bytes, **not a publisher signature**.
 
-Build with the official pinned Zig compiler. Release x86_64 artifacts use a
-baseline CPU profile; optimized `-Dcpu=native` is rejected so they work on
-older Fleet hosts.
+The regular PATH command is a directly executable file; installed state holds
+at most one immediately preceding regular binary for rollback. There is no
+release-tree history, symlink activation, release-pm, or central release manager.
+
+Build with the official pinned Zig compiler. Release x86_64 builds use a
+baseline CPU profile, not the build machine's native ISA:
 
 ```sh
 zig build -Doptimize=ReleaseSafe -Dcpu=baseline
@@ -182,57 +184,71 @@ zig build -Doptimize=ReleaseSafe -Dcpu=baseline
   --output /private/zig-audit-artifact
 ```
 
-The builder must ensure the selected Git revision is clean, pushed, and equals
-the source compiled into the artifact. For ARM64 packages created on an x86
-builder, use `--target aarch64-linux --identity-from PATH_TO_NATIVE_COMPANION`
-with an x86 binary compiled from that **same** revision. The packager checks
-the ARM ELF machine without attempting to execute it; the ARM node's installer
-executes both version aliases. Its adjacent
-`zig-audit.artifact-manifest/v1` records SHA-256, size and selected revision;
-the manifest is **digest evidence, not independently authenticated publisher
-identity**. `package.json` uses `zig-audit.package/v2` with the source
-revision, target, embedded binary hash and stable ruleset.
+For ARM64 packages built on x86, pass `--target aarch64-linux` and
+`--identity-from PATH_TO_NATIVE_COMPANION`, built from the **same source
+revision**. The packager validates the ARM ELF machine and probes the
+native companion. It must never attempt to execute ARM instructions on x86.
+Only an ARM node can qualify actual ARM execution.
 
-Targets download the same exact artifact through the existing Paste-bin lane.
-The trusted product installer (from approved source, **not code supplied by the
-unverified archive**) accepts the independently selected values:
+The archive contains exactly `package.json` (`zig-audit.package/v2`) and
+`bin/zig-audit`. Its adjacent `zig-audit.artifact-manifest/v1` carries the
+selected digest and size for review. The trusted owner installer comes from
+previously approved local source, **not executable installer code in the
+download**. The package declares revision, version, target, embedded binary
+SHA-256 and stable ruleset.
+
+After validating artifact selection, the trusted owner installer independently
+checks archive inventory, package identity, architecture, digest, and the exact
+`-v`/`--version` executable identities. Private-prefix qualification:
 
 ```sh
-./install \
-  --promote-artifact /private/stage/zig-audit-0.4.2-x86_64-linux.tar.xz \
+./install --promote-artifact /private/stage/zig-audit-0.4.2-x86_64-linux.tar.xz \
   --revision EXACT_40_CHARACTER_GIT_SHA \
   --sha256 EXACT_64_CHARACTER_ARCHIVE_SHA256 \
   --size EXACT_BYTE_COUNT \
   --prefix /private/zig-audit-prefix
-```
 
-The installer rejects missing or mismatched pins, invalid archive inventories,
-incorrect source revisions, wrong native architecture, inconsistent internal
-hashes, and mismatched `-v` or `--version` executable identities. The
-`zig-audit.artifact/v1` receipt says
-`operator-pinned-source-build-not-signed`. Artifact SHA-256 validates agreement
-with the separately selected expected bytes, **not a cryptographic signature**.
-
-The stable command is `/private/zig-audit-prefix/bin/zig-audit`. The installer
-never overwrites immutable release trees, stores previous and current symlink
-targets, and retains exact old releases and any historic release-pm receipt files:
-
-```sh
 ./install --status --prefix /private/zig-audit-prefix
 ./install --rollback --prefix /private/zig-audit-prefix
 ```
 
-The existing Fleet-wide `~/.local/bin/zig-audit` is still an older regular
-source-cutover binary. It must not be silently replaced by an installer requiring
-a product-owned symlink. First prove a separate attended transition of the
-installed PATH entry/rollback; private-prefix acceptance does not constitute
-that live transition.
-
-For source development:
+The first promotion of the currently installed Fleet-wide **regular 0.4.1
+source-cutover binary** requires an additional operator-selected SHA-256 of
+that *existing* executable:
 
 ```sh
+./install --status --prefix "$HOME/.local"
+# Review adoption_required and observed_sha256 against the existing trusted command.
+./install --promote-artifact /private/stage/zig-audit-0.4.2-x86_64-linux.tar.xz \
+  --revision EXACT_40_CHARACTER_GIT_SHA \
+  --sha256 EXACT_64_CHARACTER_ARCHIVE_SHA256 \
+  --size EXACT_BYTE_COUNT \
+  --adopt-current-sha256 INDEPENDENTLY_VERIFIED_EXISTING_BINARY_SHA256 \
+  --prefix "$HOME/.local"
+```
+
+A recognized older release-managed symlink is also supported. If its previous
+package metadata lacks a binary digest, the same explicit old-binary pin is
+mandatory. The migration validates the previous executable first, then places
+the old bytes at `share/zig-audit/previous/zig-audit`, atomically replaces
+`bin/zig-audit` with a regular executable, and retires recognized old
+releases, links and historical receipts. Any unowned data blocks cleanup.
+A transient, durable activation intent supports repair if metadata publication
+or cleanup fails after the PATH switch. It is removed on completion, not
+retained as release history. Rollback and roll-forward swap the one previous
+binary with current. No rollback generations accumulate.
+
+**The live Fleet command remains 0.4.1 until Captain approves promotion.**
+Testing a private prefix, or building a cross artifact, never constitutes
+approval to alter the installed PATH entry.
+
+For normal source development:
+
+```sh
+zig fmt --check build.zig src
 zig build test
 zig build check
+zig build
 ```
 
 ## Design boundary
