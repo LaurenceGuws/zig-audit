@@ -249,6 +249,8 @@ def test_install() -> None:
         spec = importlib.util.spec_from_loader(loader.name, loader)
         assert spec is not None
         module = importlib.util.module_from_spec(spec)
+        # The isolated installer fault proof must not pollute clean source gates.
+        sys.dont_write_bytecode = True
         loader.exec_module(module)
         fail_before = scratch / "fail-before"
         historical_release(fail_before)
